@@ -28,7 +28,7 @@
 
 - `Adapter.build(project_dir) -> BuildResult` becomes `build_command(project_dir) -> Command` plus `build_result(project_dir) -> BuildResult`, so builds use the same runner as the agent (streamed log, cancel). 
 - `data-edit` kinds: `inline`, `plain`, `number-cell` (editable text); `chart` (fields in the panel); `none` (comment target only, e.g. exhibits, tables as a whole). The adapter adds `panel_fields(source, pointer)` for chart fields.
-- History stores *states*: the state at open, then the state after every change (`edit`, `agent`, `undo`-free: undo moves a cursor), `external` when the file changed outside the editor. "Revert to before the agent run" = undo from the `agent` state.
+- History stores *states*, not before-images: the state at open (`open`), then the state after every change (`edit`, `agent`, `external` when the file changed outside the editor). Undo and redo move a cursor. "Revert to before the agent run" = undo from the `agent` state.
 - The inline markup grammar is the memo's (`**strong**`, `*em*`, `[^id]`), hard-coded in the converter for v1.
 - Memo repo depends on the editor through an optional dependency group `editor` (`uv sync --group editor`) with uv path source `../documents-editor`, until the editor repo has a git remote. `cli.py edit` explains how to install it when missing.
 - Agent-command confirmation is remembered per command (SHA-256 of the substituted argument list) in `confirmed.json` next to the user config file.
@@ -579,7 +579,7 @@ def test_events_stream_delivers_state(server):
 
 **Files:**
 - Create: `src/documents_editor/static/markup.js`
-- Test: `tests/browser/test_markup.py`, `tests/browser/conftest.py` (Playwright `page` fixture loading `markup.js` from a `file://` test page or the running server)
+- Test: `tests/browser/test_markup.py`, `tests/browser/conftest.py`: a `js` fixture that opens a Playwright page importing `markup.js` and exposes `round_trip(markup, kind)` (`toHtml` into a div, then `fromDom`) and `from_html(html, kind, original)` (set `innerHTML`, then `fromDom`)
 
 **Interfaces:**
 - Produces (ES module exports):
@@ -666,7 +666,7 @@ def test_edit_bold_comment_agent_and_survival(page, editor):  # editor fixture y
     p.click(); page.keyboard.press("End"); page.keyboard.type(" plus")
     page.keyboard.press("Shift+Control+ArrowLeft"); page.keyboard.press("Control+b"); page.keyboard.press("Enter")
     expect_json(editor.doc_path, "/paragraphs/0", "one 'q' **plus**")       # quote kept as '
-    frame.locator('[data-src="/table/0/0"]').click(selector_comment_button=True)
+    frame.locator('[data-src="/table/0/0"]').click(); frame.locator("#de-toolbar .de-comment").click()
     page.fill("#comment-instruction", "Right-align this column"); page.click("#comment-save")
     editor.set_agent(set_paths={"/title": "From agent"}, mark_done=True)
     page.click("#send-agent"); page.click("#confirm-command")
@@ -802,7 +802,7 @@ def test_pointer_attributes_do_not_change_visible_text(tmp_path):
 - Produces: `class MemoAdapter` implementing `Adapter`:
   - `name = "memo"`; `source_path` → `project_dir / "temp_memo.json"`.
   - `render_edit_html`: validate the source, call `calculate_exhibits(document.calculations, date.today())`, then `render_html_string`.
-  - `validate`: first, one located `Issue` per string per rule from `iter_strings` + `text_rule_issues`. Then `MemoDocument.model_validate`; each pydantic error becomes an `Issue` whose pointer is `pointer.format(loc)` when `loc` is non-empty, and `None` otherwise. Drop pointerless errors whose message repeats a located text-rule issue.
+  - `validate`: first, one located `Issue` per string per rule from `iter_strings` + `text_rule_issues`. Then `MemoDocument.model_validate`; each pydantic error becomes an `Issue` whose pointer comes from `_loc_to_pointer(source, loc)`, which walks the source and skips loc tokens that are not a key or index at the current node (pydantic inserts union-member tags for tagged unions); `None` for an empty `loc`. Drop pointerless errors whose message repeats a located text-rule issue.
   - `check_text` → `text_rule_issues` as errors.
   - `figure_change`: when `numeric_tokens` differ, return `"Figure changed at {location}: {old} → {new}. Update the figure where it originates (facts.json, deal.yaml or calculation inputs), recompute, and check other text, tables and charts that state or depend on it."`. `{location}` is the section heading plus `table '<title>' row r col c` for cells, or `paragraph k` otherwise.
   - `panel_fields` for chart pointers: `title` (plain), pie `labels/i` (plain), bridge `steps/i/label` (plain).
@@ -820,8 +820,10 @@ def test_validate_locates_text_rules_and_pydantic_errors():
     issues = MemoAdapter().validate(src)
     assert Issue("bare currency symbol is not allowed; use US$", "/sections/0/blocks/0/paragraphs/0") in issues
     assert all(i.pointer for i in issues)          # the duplicate pointerless one is dropped
-    src = pointer_memo(); src["sections"][0]["blocks"][2]["table"]["row_classes"] = ["total", "x"]
-    assert MemoAdapter().validate(src)[0].pointer is not None or MemoAdapter().validate(src)[0].message
+    src = pointer_memo(); src["sections"][0]["blocks"][2]["table"]["table_class"] = "bogus"
+    assert MemoAdapter().validate(src)[0].pointer == "/sections/0/blocks/2/table/table_class"
+    src = pointer_memo(); src["sections"][0]["blocks"][2]["table"]["row_classes"] = ["total"]
+    assert MemoAdapter().validate(src)[0].pointer is None   # model-level error, no loc
 
 def test_figure_change_only_when_numbers_change():
     a = MemoAdapter(); ptr = "/sections/0/blocks/2/table/rows/0/0"
