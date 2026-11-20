@@ -21,3 +21,4 @@ include = ["src/documents_editor/**/*.py", "src/documents_editor/static/*"]
 pythonpath = ["src", "."]
 testpaths = ["tests"]
 timeout = 60
+markers = ["browser: needs headless chromium via Playwright"]
