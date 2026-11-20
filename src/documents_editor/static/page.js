@@ -12,6 +12,7 @@ let readOnly = false; // the server refuses edits anyway while locked
 let edit = null; // {el, pointer, kind, original, raw, hash, savedHtml, abort, pending}
 let starting = null; // token of an edit whose raw value is being fetched
 let reloading = false; // a save succeeded; the shell is swapping the page
+let reloadPending = false; // an earlier edit saved while another edit was open
 let barTarget = null; // comment target of the toolbar outside edit mode
 let checkTimer = 0;
 let checkSeq = 0;
@@ -210,6 +211,44 @@ function finishEdit(restore) {
   clearIssues();
   post({ type: "editing", on: false });
   post({ type: "live-issues", issues: [] });
+  if (reloadPending) {
+    reloadPending = false;
+    reloading = true;
+    post({ type: "reload" });
+  }
+}
+
+// Markup of a formatting element's content, nesting flattened. Footnote chips inside it are
+// emitted as [^id] between closed emphasis runs, and edge spaces stay outside the markers,
+// so the result is valid markup: <b>this year <chip a></b> -> **this year**[^a].
+function emphasis(node, mark, text) {
+  const parts = []; // strings, or {fn}
+  const walk = (n) => {
+    for (const c of n.childNodes) {
+      if (c.nodeType === Node.TEXT_NODE) parts.push(text(c.data));
+      else if (c.nodeType !== Node.ELEMENT_NODE) continue;
+      else if (c.matches("span.de-fn")) parts.push({ fn: c.dataset.fn ?? "" });
+      else if (c.matches("br")) parts.push(" ");
+      else walk(c);
+    }
+  };
+  walk(node);
+  let out = "";
+  let run = "";
+  const flush = () => {
+    const [, lead, body, trail] = /^(\s*)([\s\S]*?)(\s*)$/.exec(run);
+    out += body ? `${lead}${mark}${body}${mark}${trail}` : run;
+    run = "";
+  };
+  for (const part of parts) {
+    if (typeof part === "string") run += part;
+    else {
+      flush();
+      out += `[^${part.fn}]`;
+    }
+  }
+  flush();
+  return out;
 }
 
 // Best-effort markup of a DOM the converter rejected: nested formatting is flattened to
@@ -222,8 +261,8 @@ function looseMarkup(root, kind, raw) {
     if (node.nodeType === Node.TEXT_NODE) out += text(node.data);
     else if (node.nodeType !== Node.ELEMENT_NODE) continue;
     else if (node.matches("span.de-fn")) out += `[^${node.dataset.fn ?? ""}]`;
-    else if (node.matches("b, strong") && node.textContent) out += `**${text(node.textContent)}**`;
-    else if (node.matches("i, em") && node.textContent) out += `*${text(node.textContent)}*`;
+    else if (node.matches("b, strong")) out += emphasis(node, "**", text);
+    else if (node.matches("i, em")) out += emphasis(node, "*", text);
     else if (node.matches("br")) out += node.nextSibling ? "\n" : "";
     else out += text(node.textContent);
   }
@@ -265,8 +304,15 @@ function commit() {
 async function save(e, markup) {
   const r = await api("POST", "/api/patch", { pointer: e.pointer, old: e.original, new: markup, source_hash: e.hash });
   if (r.status === 200) {
-    // saved, even if the user pressed Esc meanwhile: the page must show the file
+    // saved, even if the user pressed Esc meanwhile: the page must show the file, but not
+    // by reloading under another edit the user has since started
+    if (edit && edit !== e) {
+      reloadPending = true;
+      post({ type: "committed", pointer: e.pointer, figure_request: r.data.figure_request, reload: false });
+      return true;
+    }
     reloading = true;
+    reloadPending = false;
     if (edit === e) {
       edit = null;
       e.abort.abort();
@@ -414,4 +460,7 @@ window.addEventListener("message", (event) => {
 window.addEventListener("resize", renderMarkers);
 window.addEventListener("load", renderMarkers);
 document.body.append(toolbar, markerLayer);
-post({ type: "ready", pointers: [...document.querySelectorAll("[data-src]")].map((el) => el.dataset.src) });
+const announce = () =>
+  post({ type: "ready", editing: Boolean(edit), pointers: [...document.querySelectorAll("[data-src]")].map((el) => el.dataset.src) });
+handlers.hello = announce; // the shell loaded after this page and missed "ready"
+announce();

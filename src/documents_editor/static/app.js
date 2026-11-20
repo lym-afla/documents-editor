@@ -97,7 +97,7 @@ iframe.addEventListener("load", () => {
 const pageHandlers = {
   ready(m) {
     ctx.pageReady = true;
-    ctx.editing = false;
+    ctx.editing = Boolean(m.editing);
     ctx.pointers = Array.isArray(m.pointers) ? m.pointers : [];
     ctx.sendLock();
     ctx.send({ type: "highlight", pointers: ctx.highlight });
@@ -110,8 +110,11 @@ const pageHandlers = {
     ctx.highlight = [];
     ctx.historyMoved?.();
     if (m.figure_request) toast(FIGURE_TOAST, "warn", 10000);
-    ctx.reloadDoc();
+    if (m.reload !== false) ctx.reloadDoc();
     comments.refresh(ctx);
+  },
+  reload() {
+    ctx.reloadDoc();
   },
   "commit-result"(m) {
     pendingCommits.get(m.id)?.(Boolean(m.ok));
@@ -250,3 +253,9 @@ panel.init(ctx);
 comments.init(ctx);
 agent.init(ctx);
 connect();
+// The page may have announced itself before this module ran; ask again.
+try {
+  iframe.contentWindow.postMessage({ type: "hello" }, location.origin);
+} catch {
+  /* not loaded yet: it will send "ready" itself */
+}

@@ -116,6 +116,11 @@ async function savePatch(ctx, field, retried = false) {
       field.hash = fresh.hash; // another field changed; this one did not
       return savePatch(ctx, field, true);
     }
+    if (same(fresh.value, field.old)) { // the file keeps changing elsewhere
+      field.hash = fresh.hash;
+      toast("Could not save, try again", "warn");
+      return false;
+    }
     showConflict(field, fresh);
     toast("This field changed outside the editor; your text was not saved", "warn");
     return false;
@@ -204,10 +209,13 @@ export async function openRaw(ctx, pointer, reason, preset = null) {
 }
 
 async function saveRaw(ctx) {
-  if (!raw) return;
-  if (!(await savePatch(ctx, raw))) return;
-  raw = null;
-  show($("#raw-editor"), false);
+  const field = raw;
+  if (!field) return;
+  if (!(await savePatch(ctx, field))) return;
+  if (raw === field) { // not replaced by another openRaw meanwhile
+    raw = null;
+    show($("#raw-editor"), false);
+  }
   for (const field of fields) await sync(field);
 }
 

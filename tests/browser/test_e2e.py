@@ -357,3 +357,61 @@ def test_build_warning_links_to_its_page_preview(page, make_editor):
     page.click("#build-warnings .page-link")
     expect(page.locator('#page-previews figure[data-page="page-2.png"]')).to_have_class(re.compile(r"\btarget\b"))
     expect(page.locator('#page-previews figure[data-page="page-1.png"]')).not_to_have_class(re.compile(r"\btarget\b"))
+
+
+def test_raw_hand_over_keeps_footnote_chip_inside_bold(page, editor):
+    page.goto(editor.url)
+    frame = page.frame_locator("iframe#doc")
+    paragraph = start_edit(frame, '[data-src="/paragraphs/0"]')
+    # what Ctrl+B over a selection that spans a footnote chip leaves behind
+    paragraph.evaluate("""el => { el.innerHTML = 'one <b>this <i>year</i>'
+        + '<span class="de-fn" contenteditable="false" data-fn="a">a</span> and</b> end'; }""")
+    page.keyboard.press("Enter")
+    raw = page.locator("#raw-editor textarea")
+    expect(raw).to_have_value("one **this year**[^a] **and** end")
+    page.click("#raw-save")
+    expect_json(editor.doc_path, "/paragraphs/0", "one **this year**[^a] **and** end")
+    expect(frame.locator('[data-src="/paragraphs/0"] sup')).to_have_text("a")
+
+
+def test_late_save_does_not_reload_under_a_new_edit(page, editor):
+    page.goto(editor.url)
+    frame = page.frame_locator("iframe#doc")
+    held = []
+
+    def hold(route):  # hold the save's request until released
+        held.append(route)
+
+    page.route("**/api/patch", hold)
+    start_edit(frame, '[data-src="/paragraphs/0"]')
+    page.keyboard.press("End")
+    page.keyboard.type(" x")
+    page.keyboard.press("Enter")
+    while not held:
+        page.wait_for_timeout(20)
+    page.keyboard.press("Escape")  # the save is still in flight
+    title = start_edit(frame, '[data-src="/title"]')
+    held[0].continue_()
+    page.unroute("**/api/patch", hold)
+    expect_json(editor.doc_path, "/paragraphs/0", "one 'q' x")
+    page.wait_for_timeout(500)
+    expect(title).to_have_class(re.compile(r"\bde-editing\b"))  # not reloaded away
+    page.keyboard.press("Escape")  # the deferred reload now shows the saved text
+    expect(frame.locator('[data-src="/paragraphs/0"]')).to_have_text("one 'q' x")
+
+
+def test_shell_loading_after_the_page_still_connects(page, editor):
+    editor.session.add_request(pointer="/title", element="h1", quote="T", category="text",
+                               scope="document", instruction="shorter")
+    held = []
+
+    def hold(route):
+        held.append(route)
+
+    page.route("**/static/app.js", hold)
+    page.goto(editor.url, wait_until="commit")
+    frame = page.frame_locator("iframe#doc")
+    expect(frame.locator("#de-toolbar")).to_be_attached()  # page.js ran and announced itself
+    held[0].continue_()
+    page.unroute("**/static/app.js", hold)
+    expect(frame.locator(".de-marker")).to_have_count(1)  # the shell reached the page
