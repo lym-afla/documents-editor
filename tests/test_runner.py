@@ -98,3 +98,47 @@ def test_missing_executable_raises_and_stays_idle(tmp_path):
 
 def test_cancel_when_idle_is_noop():
     JobRunner().cancel()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX signals")
+def test_sigterm_ignoring_child_is_killed_after_grace(tmp_path, monkeypatch):
+    monkeypatch.setattr("documents_editor.runner.KILL_GRACE_S", 0.6)
+    script = "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('up',flush=True);time.sleep(60)"
+    r, done, lines, jobs = run([sys.executable, "-c", script], tmp_path)
+    wait_until(lambda: lines == ["up"])
+    t0 = time.monotonic()
+    r.cancel()
+    assert done.wait(10)
+    assert time.monotonic() - t0 >= 0.5
+    assert jobs[0].cancelled and jobs[0].returncode != 0
+
+
+def test_cancel_after_process_exit_is_ignored(tmp_path):
+    release = threading.Event()
+    done = threading.Event()
+    jobs = []
+    r = JobRunner()
+    r.start("t", Command([sys.executable, "-c", "print('x')"], tmp_path), timeout_s=None,
+            on_line=lambda s: release.wait(10),
+            on_exit=lambda j: (jobs.append(j), done.set()))
+    wait_until(lambda: r.current is not None and r.current.lines == ["x"])
+    time.sleep(0.5)  # child has exited; reader is still blocked in on_line
+    r.cancel()
+    release.set()
+    assert done.wait(10)
+    assert jobs[0].returncode == 0 and not jobs[0].cancelled
+
+
+def test_cancel_inside_on_exit_is_ignored(tmp_path):
+    done = threading.Event()
+    jobs = []
+    r = JobRunner()
+
+    def exit_(j):
+        r.cancel()
+        jobs.append(j)
+        done.set()
+
+    r.start("t", Command([sys.executable, "-c", "pass"], tmp_path), timeout_s=None,
+            on_line=print, on_exit=exit_)
+    assert done.wait(10) and not jobs[0].cancelled

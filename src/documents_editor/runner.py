@@ -1,16 +1,19 @@
 """One-at-a-time subprocess runner with streamed output, cancel and timeout."""
 from __future__ import annotations
 
+import logging
 import os
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
 from .adapter import Command
 
 KILL_GRACE_S = 5.0
+log = logging.getLogger(__name__)
 
 
 class Busy(RuntimeError):
@@ -84,20 +87,41 @@ class JobRunner:
         return job
 
     def cancel(self) -> None:
+        self._stop(cancelled=True)
+
+    def _stop(self, *, cancelled: bool, only: Job | None = None) -> None:
+        """Kill the current job's tree unless it already finished."""
         with self._lock:
             job, proc = self._current, self._proc
-            if job is None or proc is None:
+            if job is None or proc is None or (only is not None and job is not only):
                 return
-            job.cancelled = True
-        _kill_tree(proc)
+            if proc.poll() is not None:
+                return
+            if cancelled:
+                job.cancelled = True
+            else:
+                job.timed_out = True
+            _terminate(proc)
+        if os.name != "nt":
+            threading.Thread(target=self._escalate, args=(job, proc), daemon=True).start()
+
+    def _escalate(self, job: Job, proc: subprocess.Popen) -> None:
+        """SIGKILL the process group if it outlives the grace period."""
+        pgid = proc.pid
+        deadline = time.monotonic() + KILL_GRACE_S
+        while time.monotonic() < deadline:
+            if not _group_exists(pgid):
+                return
+            time.sleep(0.1)
+        with self._lock:
+            # Only while this job is still running, so the pgid cannot be recycled.
+            if self._current is job and _group_exists(pgid):
+                _signal_group(pgid, signal.SIGKILL)
 
     def _pump(self, job, proc, timeout_s, on_line, on_exit) -> None:
         timer = None
         if timeout_s is not None:
-            def expire() -> None:
-                job.timed_out = True
-                _kill_tree(proc)
-            timer = threading.Timer(timeout_s, expire)
+            timer = threading.Timer(timeout_s, self._stop, kwargs={"cancelled": False, "only": job})
             timer.daemon = True
             timer.start()
         try:
@@ -107,35 +131,37 @@ class JobRunner:
                 try:
                     on_line(line)
                 except Exception:
-                    pass
+                    log.exception("on_line callback failed")
             proc.wait()
         finally:
             if timer is not None:
                 timer.cancel()
-            job.returncode = proc.returncode
+            proc.stdout.close()
             with self._lock:
+                job.returncode = proc.returncode
                 self._current = None
                 self._proc = None
         on_exit(job)
 
 
-def _kill_tree(proc: subprocess.Popen) -> None:
+def _terminate(proc: subprocess.Popen) -> None:
     if os.name == "nt":
         subprocess.run(
             ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
-        return
-    _signal_group(proc.pid, signal.SIGTERM)
+    else:
+        _signal_group(proc.pid, signal.SIGTERM)
 
-    def escalate() -> None:
-        try:
-            proc.wait(KILL_GRACE_S)
-        except subprocess.TimeoutExpired:
-            pass
-        _signal_group(proc.pid, signal.SIGKILL)
 
-    threading.Thread(target=escalate, daemon=True).start()
+def _group_exists(pgid: int) -> bool:
+    try:
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
 
 
 def _signal_group(pid: int, sig: int) -> None:
