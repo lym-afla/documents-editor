@@ -109,6 +109,8 @@ class RequestsFile:
         doc, newline = self._fresh()
         for request in doc["requests"]:
             if request.get("id") == request_id:
+                if "category" in fields and request.get("category") == "figure":
+                    raise ValueError("category of a figure request cannot be changed")
                 request.update(fields)
                 self._save(doc, newline)
                 return request
@@ -126,7 +128,7 @@ class RequestsFile:
         doc, newline = self._fresh()
         requests = doc["requests"]
         existing = next(
-            (r for r in requests if r.get("type") == "figure" and r.get("origin") == "editor"
+            (r for r in requests if r.get("category") == "figure" and r.get("origin") == "editor"
              and r.get("status") == "open" and r.get("pointer") == pointer),
             None,
         )
@@ -139,11 +141,13 @@ class RequestsFile:
         if existing is None:
             now = self._now()
             existing = {
-                "id": self._new_id(requests, now), "type": "figure", "origin": "editor",
-                "status": "open", "created": now.isoformat(), "pointer": pointer,
-                "agent_note": "",
+                "id": self._new_id(requests, now), "created": now.isoformat(),
+                "pointer": pointer, "element": "text", "quote": quote,
+                "category": "figure", "origin": "editor", "scope": "document",
+                "instruction": note, "old": first_old, "new": new,
+                "status": "open", "agent_note": "",
             }
             requests.append(existing)
-        existing.update({"old": first_old, "new": new, "quote": quote, "note": note})
+        existing.update({"new": new, "quote": quote, "instruction": note})
         self._save(doc, newline)
         return existing

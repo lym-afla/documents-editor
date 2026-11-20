@@ -27,7 +27,10 @@ def test_figure_upsert_keeps_first_old_and_removes_on_restore(tmp_path):
     f.upsert_figure(pointer="/c", old="407.0", new="412.5", quote="412.5", note="n")
     r = f.upsert_figure(pointer="/c", old="412.5", new="413", quote="413", note="n")
     assert r["old"] == "407.0" and r["new"] == "413" and len(f.load()[0]) == 1
-    assert r["origin"] == "editor" and r["type"] == "figure"
+    assert r["origin"] == "editor" and r["category"] == "figure" and r["instruction"] == "n"
+    assert set(r) == {"id", "created", "pointer", "element", "quote", "category", "origin",
+                      "scope", "instruction", "old", "new", "status", "agent_note"}
+    assert (r["element"], r["scope"], r["status"], r["agent_note"]) == ("text", "document", "open", "")
     assert f.upsert_figure(pointer="/c", old="413", new="407,0", quote="", note="n") is None
     assert f.load()[0] == []
 
@@ -103,3 +106,19 @@ def test_update_validation(tmp_path):
     with pytest.raises(KeyError):
         f.delete("nope")
     assert f.update(a["id"], instruction="new", scope="house_style")["instruction"] == "new"
+
+
+def test_figure_request_stays_manageable(tmp_path):
+    f = RequestsFile(tmp_path / "r.json")
+    r = f.upsert_figure(pointer="/c", old="1", new="2", quote="2", note="n")
+    u = f.update(r["id"], status="done", instruction="changed", scope="house_style")
+    assert (u["status"], u["instruction"], u["scope"]) == ("done", "changed", "house_style")
+    with pytest.raises(ValueError):
+        f.update(r["id"], category="text")
+    with pytest.raises(ValueError):
+        f.update(r["id"], category="figure")
+    a = _add(f)
+    with pytest.raises(ValueError):
+        f.update(a["id"], category="figure")
+    f.delete(r["id"])
+    assert [x["id"] for x in f.load()[0]] == [a["id"]]

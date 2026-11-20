@@ -5,7 +5,7 @@ import re
 
 _NUMBER = re.compile(
     r"(?<![\d.,])"
-    r"(?P<num>(?:\d{1,3}(?:[   ]\d{3})+(?!\d)|\d+)(?:[.,]\d+)?)"
+    r"(?P<num>(?:\d{1,3}(?:[ \u00a0\u202f]\d{3})+(?!\d)|\d+)(?:[.,]\d+)?)"
     r"(?P<suffix>[%xх](?![^\W\d_]))?"
 )
 _MINUS = "-−"
@@ -16,7 +16,7 @@ def numeric_tokens(text: str) -> list[str]:
     tokens: list[str] = []
     for m in _NUMBER.finditer(text):
         start, end = m.span()
-        number = re.sub(r"[   ]", "", m["num"]).replace(",", ".")
+        number = re.sub(r"[ \u00a0\u202f]", "", m["num"]).replace(",", ".")
         before = text[start - 1] if start else ""
         before2 = text[start - 2] if start > 1 else ""
         negative = before == "(" and text[end:end + 1] == ")"
