@@ -2,6 +2,7 @@
 [data-src] { cursor: text; }
 [data-src]:hover { outline: 1px dashed rgba(37, 99, 235, 0.65); outline-offset: 2px; }
 [data-edit="none"], [data-edit="chart"] { cursor: pointer; }
+[data-edit="none"]:hover { outline: none; opacity: 0.6; } /* read-only: comments only */
 body.de-locked [data-src] { cursor: default; }
 body.de-locked [data-src]:hover { outline: none; }
 

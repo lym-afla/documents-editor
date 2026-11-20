@@ -6,7 +6,15 @@ import * as comments from "./comments.js";
 let before = null; // {hash, requests} when this tab started the run
 let revertSteps = 0; // undo steps back to before the agent run (each re-apply adds one)
 
+// History moved past the agent run's result (a save, undo or redo): Revert no longer means one undo.
+export function historyMoved() {
+  revertSteps = 0;
+  show($("#agent-banner .revert"), false);
+  show($("#lost-edits .revert"), false);
+}
+
 export function init(ctx) {
+  ctx.historyMoved = historyMoved;
   $("#send-agent").addEventListener("click", () => send(ctx));
   const dialog = $("#lost-edits");
   dialog.addEventListener("click", async (event) => {
@@ -18,13 +26,13 @@ export function init(ctx) {
     else if (button.matches(".keep, .keep-all")) await keep(rows);
     else if (button.matches(".revert")) {
       dialog.close();
-      await ctx.undo(revertSteps);
+      if (revertSteps) await ctx.undo(revertSteps);
     } else if (button.matches(".close")) dialog.close();
   });
   $("#agent-banner .dismiss").addEventListener("click", () => show($("#agent-banner"), false));
   $("#agent-banner .revert").addEventListener("click", async () => {
     show($("#agent-banner"), false);
-    await ctx.undo(revertSteps);
+    if (revertSteps) await ctx.undo(revertSteps);
   });
 }
 
@@ -35,7 +43,7 @@ async function snapshot() {
 
 async function send(ctx) {
   if (!(await ctx.commitPage())) {
-    toast("Finish or cancel the edit before sending to the agent", "warn");
+    toast("Finish or cancel the edit first, then send to the agent", "warn");
     return;
   }
   const preview = await api("GET", "/api/agent");

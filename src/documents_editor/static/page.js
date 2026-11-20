@@ -212,6 +212,36 @@ function finishEdit(restore) {
   post({ type: "live-issues", issues: [] });
 }
 
+// Best-effort markup of a DOM the converter rejected: nested formatting is flattened to
+// the outer tag, other elements are reduced to their text, footnote chips stay [^id].
+function looseMarkup(root, kind, raw) {
+  const text = (s) => (raw.includes("\u00a0") ? s : s.replaceAll("\u00a0", " "));
+  if (kind !== "inline") return text(root.textContent);
+  let out = "";
+  for (const node of root.childNodes) {
+    if (node.nodeType === Node.TEXT_NODE) out += text(node.data);
+    else if (node.nodeType !== Node.ELEMENT_NODE) continue;
+    else if (node.matches("span.de-fn")) out += `[^${node.dataset.fn ?? ""}]`;
+    else if (node.matches("b, strong") && node.textContent) out += `**${text(node.textContent)}**`;
+    else if (node.matches("i, em") && node.textContent) out += `*${text(node.textContent)}*`;
+    else if (node.matches("br")) out += node.nextSibling ? "\n" : "";
+    else out += text(node.textContent);
+  }
+  return out;
+}
+
+// The converter cannot represent the edit: keep editing, show why, and offer the raw editor
+// with the current text. Its save uses this edit's original value and hash.
+function handOver(e, reason) {
+  const issues = [{ message: `${reason} – finish this edit in the raw editor, or press Esc to cancel`, severity: "error", pointer: e.pointer }];
+  showIssues(e.el, issues);
+  post({ type: "live-issues", issues });
+  const markup = looseMarkup(e.el, e.kind, e.raw);
+  if (markup === e.handedOver) return; // already offered (e.g. blur after Enter)
+  e.handedOver = markup;
+  post({ type: "raw", pointer: e.pointer, reason, markup, old: e.original, hash: e.hash });
+}
+
 // Commit the current edit. Resolves true when nothing is left unsaved.
 function commit() {
   const e = edit;
@@ -219,8 +249,7 @@ function commit() {
   if (e.pending) return e.pending;
   const result = fromDom(e.el, e.kind, e.raw);
   if (!result.ok) {
-    finishEdit(true);
-    post({ type: "raw", pointer: e.pointer, reason: result.reason });
+    handOver(e, result.reason);
     return Promise.resolve(false);
   }
   if (result.markup === e.raw) {
@@ -235,19 +264,22 @@ function commit() {
 
 async function save(e, markup) {
   const r = await api("POST", "/api/patch", { pointer: e.pointer, old: e.original, new: markup, source_hash: e.hash });
-  if (edit !== e) return false;
   if (r.status === 200) {
-    edit = null;
+    // saved, even if the user pressed Esc meanwhile: the page must show the file
     reloading = true;
-    e.abort.abort();
-    clearTimeout(checkTimer);
-    e.el.removeAttribute("contenteditable");
-    e.el.classList.replace("de-editing", "de-saving");
-    hideToolbar();
-    clearIssues();
+    if (edit === e) {
+      edit = null;
+      e.abort.abort();
+      clearTimeout(checkTimer);
+      e.el.removeAttribute("contenteditable");
+      e.el.classList.replace("de-editing", "de-saving");
+      hideToolbar();
+      clearIssues();
+    }
     post({ type: "committed", pointer: e.pointer, figure_request: r.data.figure_request });
     return true;
   }
+  if (edit !== e) return false;
   if (r.status === 422) {
     const issues = r.data.issues?.length ? r.data.issues : [{ message: errorText(r.data), severity: "error" }];
     showIssues(e.el, issues);

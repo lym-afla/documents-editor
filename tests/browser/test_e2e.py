@@ -1,4 +1,5 @@
 """End to end: the editor UI in headless Chromium against a real server and a fake agent."""
+import base64
 import json
 import re
 import sys
@@ -11,6 +12,7 @@ from urllib.parse import urlsplit
 import pytest
 
 from documents_editor import pointer as ptr
+from documents_editor.adapter import BuildResult, Issue
 from documents_editor.events import EventBus
 from documents_editor.runner import JobRunner
 from documents_editor.server import make_server
@@ -64,39 +66,50 @@ class Editor:
 
 
 @pytest.fixture
-def editor(tmp_path):
-    project = tmp_path / "project"
-    project.mkdir()
-    doc_path = project / "doc.json"
-    doc_path.write_text(json.dumps(DOC, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    (tmp_path / "agent.py").write_text(AGENT_SCRIPT, encoding="utf-8")
-    session = EditorSession(SimpleDocAdapter(), project, bus=EventBus(), runner=JobRunner(),
-                            config_file=tmp_path / "cfg.toml",
-                            confirm_file=tmp_path / "confirmed.json")
-    httpd, url = make_server(session)
-    stop = threading.Event()
+def make_editor(tmp_path):
+    """Start an editor (server + external-change poll) on a fresh project; config under tmp_path."""
+    started = []
 
-    def poll():
-        while not stop.wait(0.5):
-            session.poll_external()
+    def make(adapter=None):
+        project = tmp_path / "project"
+        project.mkdir()
+        doc_path = project / "doc.json"
+        doc_path.write_text(json.dumps(DOC, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        (tmp_path / "agent.py").write_text(AGENT_SCRIPT, encoding="utf-8")
+        session = EditorSession(adapter or SimpleDocAdapter(), project, bus=EventBus(),
+                                runner=JobRunner(), config_file=tmp_path / "cfg.toml",
+                                confirm_file=tmp_path / "confirmed.json")
+        httpd, url = make_server(session)
+        stop = threading.Event()
 
-    threads = [threading.Thread(target=httpd.serve_forever, daemon=True),
-               threading.Thread(target=poll, daemon=True)]
-    for t in threads:
-        t.start()
-    yield Editor(url, doc_path, project, session)
-    stop.set()
-    session.cancel_job()
-    deadline = time.monotonic() + 15
-    while session.state()["job"] is not None and time.monotonic() < deadline:
-        time.sleep(0.02)
-    httpd.shutdown()
-    httpd.server_close()
-    session.close()
+        def poll():
+            while not stop.wait(0.5):
+                session.poll_external()
+
+        for target in (httpd.serve_forever, poll):
+            threading.Thread(target=target, daemon=True).start()
+        started.append((session, httpd, stop))
+        return Editor(url, doc_path, project, session)
+
+    yield make
+    for session, httpd, stop in started:
+        stop.set()
+        session.cancel_job()
+        deadline = time.monotonic() + 15
+        while session.state()["job"] is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        httpd.shutdown()
+        httpd.server_close()
+        session.close()
 
 
 @pytest.fixture
-def page(browser, editor):
+def editor(make_editor):
+    return make_editor()
+
+
+@pytest.fixture
+def page(browser):
     context = browser.new_context()
     outside = []
     # Record, not route: a sync route handler would stall requests while the test sleeps.
@@ -234,14 +247,54 @@ def test_unrepresentable_edit_goes_to_raw_editor(page, editor):
     page.goto(editor.url)
     frame = page.frame_locator("iframe#doc")
     paragraph = start_edit(frame, '[data-src="/paragraphs/0"]')
-    paragraph.evaluate("el => { el.innerHTML = 'one <u>under</u>'; }")
+    # nested formatting (Ctrl+I inside bold) and a stray element cannot become markup
+    paragraph.evaluate("el => { el.innerHTML = 'one <b>bo<i>ld</i></b> <u>under</u>'; }")
     page.keyboard.press("Enter")
     raw = page.locator("#raw-editor textarea")
-    expect(raw).to_have_value("one 'q'")
-    raw.fill("one *raw*")
+    expect(raw).to_have_value("one **bold** under")  # the user's text, flattened
+    expect(paragraph).to_have_class(re.compile(r"\bde-editing\b"))  # still open, not discarded
+    expect(frame.locator(".de-issue")).to_contain_text("Nested formatting")
+    page.click("#rebuild")  # commit-now reports the open edit truthfully
+    expect(page.locator(".toast").last).to_contain_text("Finish or cancel the edit")
+    expect(raw).to_have_value("one **bold** under")
+    assert not (editor.project / "build.log").exists()
     page.click("#raw-save")
-    expect_json(editor.doc_path, "/paragraphs/0", "one *raw*")
-    expect(frame.locator('[data-src="/paragraphs/0"] em')).to_have_text("raw")
+    expect_json(editor.doc_path, "/paragraphs/0", "one **bold** under")
+    expect(frame.locator('[data-src="/paragraphs/0"] strong')).to_have_text("bold")
+    expect(frame.locator(".de-editing")).to_have_count(0)
+    expect(page.locator("#raw-editor")).to_be_hidden()
+
+
+def test_outside_change_is_not_overwritten_by_panel_save(page, editor):
+    page.goto(editor.url)
+    frame = page.frame_locator("iframe#doc")
+    frame.locator('[data-src="/chart"]').click()
+    title = page.locator('#element-fields [data-pointer="/chart/title"]')
+    label = page.locator('#element-fields [data-pointer="/chart/labels/0"]')
+    expect(title.locator("input")).to_have_value("c")
+    title.locator("input").fill("mine")
+    label.locator("input").fill("unsaved label")
+    doc = json.loads(editor.doc_path.read_text(encoding="utf-8"))
+    doc["chart"]["title"] = "outside"
+    editor.doc_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    expect(frame.locator('[data-src="/chart"] figcaption')).to_have_text("outside")  # poll saw it
+    title.locator("button").click()
+    expect(title.locator(".conflict")).to_contain_text("outside")
+    expect(title.locator("input")).to_have_value("mine")
+    time.sleep(0.3)
+    expect_json(editor.doc_path, "/chart/title", "outside")
+    title.locator("button").click()  # a deliberate second save replaces it
+    expect_json(editor.doc_path, "/chart/title", "mine")
+    expect(title.locator(".conflict")).to_be_hidden()
+    expect(label.locator("input")).to_have_value("unsaved label")  # other fields keep their text
+    # an outside change to another field does not block a save (rebase)
+    doc = json.loads(editor.doc_path.read_text(encoding="utf-8"))
+    doc["title"] = "Elsewhere"
+    editor.doc_path.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    expect(frame.locator('[data-src="/title"]')).to_have_text("Elsewhere")
+    label.locator("button").click()
+    expect_json(editor.doc_path, "/chart/labels/0", "unsaved label")
+    expect_json(editor.doc_path, "/title", "Elsewhere")
 
 
 def test_state_events_do_not_disturb_typing_and_scroll_is_kept(page, editor):
@@ -268,8 +321,8 @@ def test_state_events_do_not_disturb_typing_and_scroll_is_kept(page, editor):
     expect_json(editor.doc_path, "/paragraphs/59", "paragraph 59 ab")
     expect(paragraph).to_have_text("paragraph 59 ab")
     expect(paragraph).not_to_have_class(re.compile(r"\bde-saving\b"))
-    doc_frame = page.frame(url=re.compile(r"/doc$"))
-    assert abs(doc_frame.evaluate("scrollY") - scrolled) < 5
+    page.frame(url=re.compile(r"/doc$")).wait_for_function(
+        f"document.readyState === 'complete' && Math.abs(scrollY - {scrolled}) < 5", timeout=10_000)
 
 
 def test_rebuild_shows_pages_tab_and_log(page, editor):
@@ -280,3 +333,27 @@ def test_rebuild_shows_pages_tab_and_log(page, editor):
     expect(page.locator("#log")).to_contain_text("build started")
     expect(page.locator("#rebuild")).to_be_enabled()
     assert (editor.project / "build.log").read_text(encoding="utf-8") == "built\n"
+
+
+PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
+class PagedAdapter(SimpleDocAdapter):
+    def build_result(self, project_dir):
+        pages = [project_dir / "page-1.png", project_dir / "page-2.png"]
+        for page in pages:
+            page.write_bytes(PNG)
+        return BuildResult(pages, [Issue("Table overflows on page 2", severity="warning"),
+                                   Issue("Widow line", severity="warning")])
+
+
+def test_build_warning_links_to_its_page_preview(page, make_editor):
+    editor = make_editor(PagedAdapter())
+    page.goto(editor.url)
+    page.click("#rebuild")
+    expect(page.locator("#page-previews figure")).to_have_count(2)
+    expect(page.locator("#build-warnings .page-link")).to_have_count(1)  # "Widow line" names no page
+    page.click("#build-warnings .page-link")
+    expect(page.locator('#page-previews figure[data-page="page-2.png"]')).to_have_class(re.compile(r"\btarget\b"))
+    expect(page.locator('#page-previews figure[data-page="page-1.png"]')).not_to_have_class(re.compile(r"\btarget\b"))

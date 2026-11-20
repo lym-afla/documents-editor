@@ -6,6 +6,7 @@ import * as comments from "./comments.js";
 import * as panel from "./panel.js";
 
 const FIGURE_TOAST = "Figure changed – the agent will reconcile facts and calculations";
+const UNFINISHED = "Finish or cancel the edit first";
 const iframe = $("#doc");
 
 const ctx = {
@@ -52,7 +53,11 @@ const ctx = {
   },
 
   async undo(steps = 1) {
-    if (!(await this.commitPage())) return false;
+    if (!(await this.commitPage())) {
+      toast(UNFINISHED, "warn");
+      return false;
+    }
+    this.historyMoved?.();
     for (let i = 0; i < steps; i++) {
       const r = await api("POST", "/api/undo");
       if (r.status !== 200) {
@@ -103,6 +108,7 @@ const pageHandlers = {
   },
   committed(m) {
     ctx.highlight = [];
+    ctx.historyMoved?.();
     if (m.figure_request) toast(FIGURE_TOAST, "warn", 10000);
     ctx.reloadDoc();
     comments.refresh(ctx);
@@ -123,7 +129,8 @@ const pageHandlers = {
     toast(String(m.text), m.kind === "error" ? "error" : "info");
   },
   raw(m) {
-    panel.openRaw(ctx, m.pointer, m.reason);
+    const preset = typeof m.markup === "string" ? { markup: m.markup, old: m.old, hash: m.hash } : null;
+    panel.openRaw(ctx, m.pointer, m.reason, preset);
   },
   comment(m) {
     comments.setTarget(ctx, { pointer: m.pointer ?? null, element: m.element, quote: m.quote ?? "" });
@@ -214,7 +221,11 @@ function connect() {
 // -- top bar ------------------------------------------------------------------
 $("#undo").addEventListener("click", () => ctx.undo());
 $("#redo").addEventListener("click", async () => {
-  if (!(await ctx.commitPage())) return;
+  if (!(await ctx.commitPage())) {
+    toast(UNFINISHED, "warn");
+    return;
+  }
+  ctx.historyMoved?.();
   const r = await api("POST", "/api/redo");
   if (r.status !== 200) toast(errorText(r.data), "error");
   ctx.reloadDoc();
@@ -222,7 +233,7 @@ $("#redo").addEventListener("click", async () => {
 });
 $("#rebuild").addEventListener("click", async () => {
   if (!(await ctx.commitPage())) {
-    toast("Finish or cancel the edit before rebuilding", "warn");
+    toast(`${UNFINISHED}, then rebuild`, "warn");
     return;
   }
   const r = await api("POST", "/api/build");

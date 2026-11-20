@@ -5,12 +5,24 @@
     "Costs were *flat* at 340 units[^b]."
   ],
   "table": [
-    ["Quarter", "Revenue"],
-    ["Q1", 120],
-    ["Q2", 135.5]
+    [
+      "Quarter",
+      "Revenue"
+    ],
+    [
+      "Q1",
+      120
+    ],
+    [
+      "Q2",
+      135.5
+    ]
   ],
   "chart": {
     "title": "Revenue by quarter",
-    "labels": ["Q1", "Q2"]
+    "labels": [
+      "Q1",
+      "Q2"
+    ]
   }
 }

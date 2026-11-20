@@ -6,7 +6,6 @@ const LOG_LINES = 5000;
 const tabs = () => [...document.querySelectorAll('#tabs [role="tab"]')];
 let liveIssues = [];
 let stateIssues = [];
-let raw = null; // {pointer, old, hash} of the field in the raw editor
 
 export function init(ctx) {
   ctx.showTab = showTab;
@@ -44,6 +43,8 @@ export function showTab(name, focus = false) {
 }
 
 // -- saving a single field from the panel -------------------------------------
+// A field: {pointer, old, hash, loaded, input, issues, conflict}. `old` and `hash` are what
+// a save sends; `loaded` is the text the input was filled with (to tell unsaved text).
 async function loadValue(pointer) {
   const r = await api("GET", `/api/value?pointer=${q(pointer)}`);
   if (r.status !== 200) {
@@ -53,65 +54,120 @@ async function loadValue(pointer) {
   return r.data; // {value, hash}
 }
 
-// Patch one field; returns true on success, else shows the problem in `issuesList`.
-async function savePatch(ctx, field, text, issuesList) {
+const asText = (value) => (value === null || value === undefined ? "" : String(value));
+const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+const dirty = (field) => field.input.value !== field.loaded;
+
+function makeField(pointer, current, input) {
+  input.value = asText(current.value);
+  return {
+    pointer, old: current.value, hash: current.hash, loaded: input.value, input,
+    issues: h("ul", { class: "issues" }), conflict: h("div", { class: "conflict", hidden: true }),
+  };
+}
+
+function fill(field, fresh) {
+  Object.assign(field, { old: fresh.value, hash: fresh.hash });
+  field.input.value = field.loaded = asText(fresh.value);
+  show(field.conflict, false);
+}
+
+// The field's value changed outside the editor while the user has unsaved text: keep the
+// text, show the file's value, and let a second Save replace it deliberately.
+function showConflict(field, fresh) {
+  Object.assign(field, { old: fresh.value, hash: fresh.hash });
+  field.conflict.replaceChildren(
+    h("strong", { text: "Changed outside the editor." }), " The file now has:",
+    h("pre", { class: "current", text: asText(fresh.value) }),
+    "Your text is kept above and was not saved. Save again to replace the file's text with it.",
+  );
+  show(field.conflict, true);
+}
+
+// Bring a field up to date with the file after the file changed.
+async function sync(field) {
+  const fresh = await loadValue(field.pointer);
+  if (!fresh) return;
+  if (same(fresh.value, field.old)) field.hash = fresh.hash;
+  else if (!dirty(field)) fill(field, fresh);
+  else showConflict(field, fresh);
+}
+
+// Patch one field; returns true on success.
+async function savePatch(ctx, field, retried = false) {
+  const text = field.input.value;
   const r = await api("POST", "/api/patch", {
     pointer: field.pointer, old: field.old, new: text, source_hash: field.hash,
   });
-  issuesList.replaceChildren();
+  field.issues.replaceChildren();
   if (r.status === 200) {
+    show(field.conflict, false);
+    field.hash = r.data.hash;
     ctx.highlight = [];
+    ctx.historyMoved?.();
     if (r.data.figure_request) toast("Figure changed – the agent will reconcile facts and calculations", "warn", 10000);
     ctx.reloadDoc();
     return true;
   }
   if (r.status === 409 && r.data.error === "stale") {
-    toast("The file changed outside the editor; the field was reloaded", "warn");
     const fresh = await loadValue(field.pointer);
-    if (fresh) Object.assign(field, { old: fresh.value, hash: fresh.hash });
+    if (!fresh) return false;
+    if (same(fresh.value, field.old) && !retried) {
+      field.hash = fresh.hash; // another field changed; this one did not
+      return savePatch(ctx, field, true);
+    }
+    showConflict(field, fresh);
+    toast("This field changed outside the editor; your text was not saved", "warn");
     return false;
   }
   if (r.status === 422) {
-    issuesList.replaceChildren(...(r.data.issues || [r.data]).map((i) => h("li", { text: i.message })));
+    field.issues.replaceChildren(...(r.data.issues || [r.data]).map((i) => h("li", { text: i.message })));
     return false;
   }
   toast(errorText(r.data), "error");
   return false;
 }
 
-const asText = (value) => (value === null || value === undefined ? "" : String(value));
+const discardOk = (fields) =>
+  !fields.some(dirty) || window.confirm("Discard the unsaved text in the Element tab?");
 
 // -- Element tab: chart fields ------------------------------------------------
+let fieldsPointer = null;
+let fields = [];
+
 export async function openFields(ctx, pointer) {
-  closeRaw();
+  if (pointer === fieldsPointer && fields.some(dirty)) return showTab("element");
+  if (!discardOk(fields)) return showTab("element");
   const r = await api("GET", `/api/fields?pointer=${q(pointer)}`);
-  const box = $("#element-fields");
   if (r.status !== 200) {
     toast(errorText(r.data), "error");
     return;
   }
   show($("#element-empty"), false);
+  const next = [];
   const rows = [];
   for (const spec of r.data) {
     const current = await loadValue(spec.pointer);
     if (!current) continue;
-    const field = { pointer: spec.pointer, old: current.value, hash: current.hash };
     const input = spec.kind === "inline" ? h("textarea", { rows: 2 }) : h("input", { type: "text" });
-    input.value = asText(current.value);
-    const issues = h("ul", { class: "issues" });
+    const field = makeField(spec.pointer, current, input);
+    next.push(field);
     const save = async () => {
-      if (await savePatch(ctx, field, input.value, issues)) openFields(ctx, pointer);
+      if (!(await savePatch(ctx, field))) return;
+      field.loaded = field.input.value;
+      for (const other of fields) await sync(other); // the file changed: refresh the others
     };
-    const id = `field-${rows.length}`;
-    input.id = id;
+    input.id = `field-${rows.length}`;
     input.addEventListener("keydown", (e) => {
       if (e.key === "Enter" && input.tagName === "INPUT") save();
     });
     rows.push(h("div", { class: "field", "data-pointer": spec.pointer },
-      h("label", { for: id, text: spec.label }), input,
-      h("button", { type: "button", text: "Save", onclick: save }), issues));
+      h("label", { for: input.id, text: spec.label }), input,
+      h("button", { type: "button", text: "Save", onclick: save }), field.issues, field.conflict));
   }
-  box.replaceChildren(
+  fieldsPointer = pointer;
+  fields = next;
+  $("#element-fields").replaceChildren(
     h("h3", {}, "Fields of ", h("code", { text: pointer })),
     ...(rows.length ? rows : [h("p", { class: "muted", text: "This element has no editable fields." })]),
   );
@@ -119,26 +175,40 @@ export async function openFields(ctx, pointer) {
 }
 
 // -- Element tab: raw editor --------------------------------------------------
-export async function openRaw(ctx, pointer, reason) {
-  const current = await loadValue(pointer);
-  if (!current) return;
-  raw = { pointer, old: current.value, hash: current.hash };
+let raw = null; // the field in the raw editor
+
+// preset: {markup, old, hash} when the page hands over an edit the converter could not represent.
+export async function openRaw(ctx, pointer, reason, preset = null) {
   const editor = $("#raw-editor");
+  const textarea = $("textarea", editor);
+  if (raw && dirty(raw)) {
+    const replaces = raw.pointer !== pointer || (preset && preset.markup !== textarea.value);
+    if (!replaces || !window.confirm("Replace the unsaved text in the raw editor?")) return showTab("element");
+  }
+  const current = preset ? { value: preset.old, hash: preset.hash } : await loadValue(pointer);
+  if (!current) return;
+  raw = makeField(pointer, current, textarea);
+  if (preset) {
+    textarea.value = preset.markup; // the user's current text, unsaved
+    raw.loaded = asText(preset.old);
+  }
   $(".pointer", editor).textContent = pointer;
   $(".reason", editor).textContent = reason
-    ? `The edit could not be converted (${reason}). Edit the source text here instead.`
+    ? `The edit could not be converted (${reason}). Finish it here; Save writes this text.`
     : "Edit the source text, including ** and * markup.";
-  $("textarea", editor).value = asText(current.value);
-  $(".issues", editor).replaceChildren();
+  $(".issues", editor).replaceWith(raw.issues);
+  $(".conflict", editor).replaceWith(raw.conflict);
   show(editor, true);
   showTab("element");
-  $("textarea", editor).focus();
+  textarea.focus();
 }
 
 async function saveRaw(ctx) {
   if (!raw) return;
-  const editor = $("#raw-editor");
-  if (await savePatch(ctx, raw, $("textarea", editor).value, $(".issues", editor))) closeRaw();
+  if (!(await savePatch(ctx, raw))) return;
+  raw = null;
+  show($("#raw-editor"), false);
+  for (const field of fields) await sync(field);
 }
 
 function closeRaw() {
@@ -184,13 +254,35 @@ export function appendLog(line) {
 }
 
 // -- Pages tab ----------------------------------------------------------------
+// The preview a warning names: a page file name in its text or pointer, or "page N".
+function namedPage(warning, pages) {
+  const text = `${warning.message} ${warning.pointer ?? ""}`;
+  const byName = pages.find((name) => text.includes(name));
+  if (byName) return byName;
+  const n = /\bpage\s+(\d+)\b/i.exec(text);
+  return n && pages[Number(n[1]) - 1] ? pages[Number(n[1]) - 1] : null;
+}
+
+function revealPage(name) {
+  const figure = [...document.querySelectorAll("#page-previews figure")].find((f) => f.dataset.page === name);
+  if (!figure) return;
+  for (const f of document.querySelectorAll("#page-previews figure.target")) f.classList.remove("target");
+  figure.classList.add("target");
+  figure.scrollIntoView({ block: "start" });
+}
+
 export function showBuild(report) {
   show($("#pages-empty"), !report.pages.length);
   $("#pages-empty").textContent = report.pages.length ? "" : "The build produced no page previews.";
-  $("#build-warnings").replaceChildren(...report.warnings.map((w) =>
-    h("li", { class: w.severity || "warning" }, h("span", { text: w.message }), w.pointer ? h("code", { text: w.pointer }) : "")));
+  $("#build-warnings").replaceChildren(...report.warnings.map((w) => {
+    const page = namedPage(w, report.pages);
+    return h("li", { class: w.severity || "warning" },
+      h("span", { text: w.message }), w.pointer ? h("code", { text: w.pointer }) : "",
+      page ? h("button", { type: "button", class: "link page-link", text: `Show ${page}`, onclick: () => revealPage(page) }) : "");
+  }));
   $("#page-previews").replaceChildren(...report.pages.map((name) =>
-    h("figure", {}, h("img", { src: `/api/pages/${q(name)}?v=${Date.now()}`, alt: `Page preview ${name}`, loading: "lazy" }),
+    h("figure", { "data-page": name },
+      h("img", { src: `/api/pages/${q(name)}?v=${Date.now()}`, alt: `Page preview ${name}`, loading: "lazy" }),
       h("figcaption", { text: name }))));
   toast(report.ok ? "Build finished" : "Build failed – see the Log tab", report.ok ? "info" : "error");
   showTab("pages");
