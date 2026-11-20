@@ -1,10 +1,9 @@
 // Converts between the source's light markup and contenteditable DOM.
 // The token regex mirrors the memo renderer's.
-const TOKEN = /\*\*(.+?)\*\*|\*([^*]+?)\*|\[\^([A-Za-z0-9_-]+)\]/g;
+const TOKEN = /\*\*([^\n]+?)\*\*|\*([^*]+?)\*|\[\^([A-Za-z0-9_-]+)\]/g;
 const FN_ID = /^[A-Za-z0-9_-]+$/;
 const NBSP = " ";
 const STAR_ISSUE = "A literal * will be read as emphasis";
-const FN_ISSUE = "A literal [^id] will be read as a footnote marker";
 
 function esc(s) {
   return s
@@ -42,11 +41,9 @@ export function literalStarIssue(markup) {
 const fail = (reason) => ({ ok: false, reason });
 
 // Serialise root's children. keepNbsp leaves NBSP untouched.
-function serialise(root, kind, keepNbsp) {
+function serialise(root, kind, keepNbsp, noCheck = false) {
   const issues = new Set();
   const text = (s) => {
-    if (s.includes("*")) issues.add(STAR_ISSUE);
-    if (/\[\^[A-Za-z0-9_-]+\]/.test(s)) issues.add(FN_ISSUE);
     return keepNbsp ? s : s.replaceAll(NBSP, " ");
   };
   const nodes = [...root.childNodes].filter((n) => n.nodeType !== 8);
@@ -56,13 +53,15 @@ function serialise(root, kind, keepNbsp) {
   const segs = []; // {type: "text"|"strong"|"em"|"fn", value}
   for (const n of nodes) {
     if (n.nodeType === 3) {
-      segs.push({ type: "text", value: text(n.data) });
+      if (kind === "inline" && n.data.includes("*")) issues.add(STAR_ISSUE);
+      const value = text(n.data);
+      if (value !== "") segs.push({ type: "text", value });
       continue;
     }
     if (n.nodeType !== 1) return fail("Unsupported node");
     if (kind !== "inline") return fail(`Unsupported element <${n.localName}>`);
     const tag = n.tagName;
-    if (n.classList.contains("de-fn")) {
+    if (tag === "SPAN" && n.classList.contains("de-fn")) {
       const id = n.getAttribute("data-fn") ?? "";
       if (!FN_ID.test(id)) return fail("Invalid footnote marker");
       segs.push({ type: "fn", value: id });
@@ -75,7 +74,8 @@ function serialise(root, kind, keepNbsp) {
         if (c.nodeType !== 3) return fail("Nested formatting");
         value += text(c.data);
       }
-      if (type === "strong" && /[\r\n]/.test(value)) return fail("Line break inside bold");
+      if (type === "strong" && value.includes("\n")) return fail("Line break inside bold");
+      if (type === "em" && value.includes("\n")) return fail("Line break inside italic");
       if (value !== "") segs.push({ type, value });
     } else {
       return fail(`Unsupported element <${n.localName}>`);
@@ -95,7 +95,16 @@ function serialise(root, kind, keepNbsp) {
       : s.type === "fn" ? `[^${s.value}]`
       : s.value)
     .join("");
-  return { ok: true, markup, issues: [...issues] };
+  if (kind === "inline" && !noCheck) {
+    // The markup must parse back to exactly these segments.
+    const scratch = root.ownerDocument.createElement("div");
+    scratch.innerHTML = toHtml(markup, kind);
+    const back = serialise(scratch, kind, keepNbsp, true);
+    if (!back.ok || JSON.stringify(back.segs) !== JSON.stringify(merged)) {
+      return fail("Formatting cannot be represented");
+    }
+  }
+  return { ok: true, markup, issues: [...issues], segs: merged };
 }
 
 export function fromDom(root, kind, original) {
@@ -108,5 +117,7 @@ export function fromDom(root, kind, original) {
       return { ok: true, markup: original, issues: [] };
     }
   }
-  return serialise(root, kind, original.includes(NBSP));
+  const res = serialise(root, kind, original.includes(NBSP));
+  if (!res.ok) return res;
+  return { ok: true, markup: res.markup, issues: res.issues };
 }

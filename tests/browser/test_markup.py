@@ -10,19 +10,23 @@ pytestmark = pytest.mark.browser
         "plain 'q' – US$",
         "a **b** c *d* e[^n1]",
         "Ёлка **x**[^a_b]",
-        "a b  c",
+        "a\u00a0b  c",
         "2 * 3",
         "**",
         "<b>&amp;</b> \"q\"",
         "**a *b* c**",
         "x[^bad id]",
+        "emoji \U0001f600 **b\U0001f680**",
+        "line1\nline2 *e*",
+        "**a***b*",
+        "*a***b**",
     ],
 )
 def test_round_trip_unchanged(js, markup):
     assert js.round_trip(markup, "inline") == {"ok": True, "markup": markup, "issues": []}
 
 
-@pytest.mark.parametrize("markup", ["", "a **b** *c* & <d>", "x y"])
+@pytest.mark.parametrize("markup", ["", "a **b** *c* & <d>", "x\u00a0y"])
 def test_round_trip_plain(js, markup):
     assert js.round_trip(markup, "plain") == {"ok": True, "markup": markup, "issues": []}
 
@@ -43,7 +47,7 @@ def test_normalises_browser_artefacts(js, html, expected):
 
 
 def test_nbsp_kept_when_original_has_it(js):
-    assert js.from_html("a&nbsp;b!", "inline", original="x y")["markup"] == "a b!"
+    assert js.from_html("a&nbsp;b!", "inline", original="x\u00a0y")["markup"] == "a\u00a0b!"
 
 
 @pytest.mark.parametrize(
@@ -83,3 +87,47 @@ def test_to_html_escapes(js):
 def test_literal_star_issue(js):
     assert js.literal_star_issue("a **b** *c*") is None
     assert js.literal_star_issue("2 * 3") == "A literal * will be read as emphasis"
+
+
+@pytest.mark.parametrize(
+    "html",
+    ["<em>a*b</em>", "<strong>a**b</strong>", "x <em>*</em>"],
+)
+def test_ambiguous_formatting_goes_to_raw_editor(js, html):
+    r = js.from_html(html, "inline", original="seed")
+    assert r["ok"] is False
+
+
+def test_literal_footnote_text_goes_to_raw_editor(js):
+    assert js.from_html("see [^n1]", "inline", original="seed")["ok"] is False
+
+
+def test_star_inside_bold_is_fine(js):
+    assert js.from_html("<strong>a*b</strong>", "inline", original="seed") == {
+        "ok": True, "markup": "**a*b**", "issues": []}
+
+
+def test_plain_has_no_issues_for_star(js):
+    assert js.from_html("2 * 3 [^n]", "plain", original="seed") == {
+        "ok": True, "markup": "2 * 3 [^n]", "issues": []}
+
+
+def test_real_contenteditable_bold(js):
+    result = js.page.evaluate(
+        """async () => {
+            const m = await import('/markup.js');
+            const div = document.createElement('div');
+            div.contentEditable = 'true';
+            div.innerHTML = m.toHtml('hello world', 'inline');
+            document.body.appendChild(div);
+            div.focus();
+            const t = div.firstChild;
+            const sel = getSelection();
+            const r = document.createRange();
+            r.setStart(t, 0); r.setEnd(t, 5);
+            sel.removeAllRanges(); sel.addRange(r);
+            document.execCommand('bold');
+            return m.fromDom(div, 'inline', 'hello world');
+        }"""
+    )
+    assert result == {"ok": True, "markup": "**hello** world", "issues": []}
