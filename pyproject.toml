@@ -1,0 +1,23 @@
+[project]
+name = "documents-editor"
+version = "0.1.0"
+description = "Local browser editor for agent-built JSON documents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[dependency-groups]
+dev = ["pytest>=9.0", "pytest-timeout>=2.3", "playwright>=1.55"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/documents_editor"]
+include = ["src/documents_editor/**/*.py", "src/documents_editor/static/*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "."]
+testpaths = ["tests"]
+timeout = 60
