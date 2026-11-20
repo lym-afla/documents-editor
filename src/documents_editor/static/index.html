@@ -2,10 +2,94 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Document editor</title>
-<link rel="stylesheet" href="/static/page.css">
+<link rel="stylesheet" href="/static/editor.css">
+<script type="module" src="/static/app.js"></script>
 </head>
 <body>
-<iframe id="doc" src="/doc"></iframe>
+<header id="topbar">
+  <button type="button" id="undo" disabled title="Undo the last saved change">Undo</button>
+  <button type="button" id="redo" disabled title="Redo">Redo</button>
+  <button type="button" id="send-agent" disabled title="Run the agent on the open comments">Send to agent <span class="badge" id="open-count" hidden></span></button>
+  <button type="button" id="rebuild" disabled title="Run the full build and show page previews">Rebuild</button>
+  <span id="status" role="status" aria-live="polite">Connecting…</span>
+  <button type="button" id="cancel-job" hidden>Cancel</button>
+</header>
+<div id="banners">
+  <div id="lock-banner" class="banner info" hidden></div>
+  <div id="invalid-banner" class="banner error" hidden><span class="text"></span> <button type="button" class="revert" hidden>Revert</button></div>
+  <div id="outside-banner" class="banner warn" hidden><span class="text">The file changed outside the editor.</span> <button type="button" class="reload">Reload</button></div>
+  <div id="agent-banner" class="banner error" hidden><span class="text"></span> <button type="button" class="revert" hidden>Revert to before the agent run</button> <button type="button" class="dismiss">Dismiss</button></div>
+  <ul id="notices" class="banner warn" hidden></ul>
+</div>
+<main id="layout">
+  <iframe id="doc" src="/doc" title="Document"></iframe>
+  <aside id="panel">
+    <div role="tablist" id="tabs" aria-label="Panel">
+      <button type="button" role="tab" id="tab-comments" aria-controls="pane-comments" aria-selected="true">Comments</button>
+      <button type="button" role="tab" id="tab-element" aria-controls="pane-element" aria-selected="false" tabindex="-1">Element</button>
+      <button type="button" role="tab" id="tab-checks" aria-controls="pane-checks" aria-selected="false" tabindex="-1">Checks <span class="badge" id="issue-count" hidden></span></button>
+      <button type="button" role="tab" id="tab-pages" aria-controls="pane-pages" aria-selected="false" tabindex="-1">Pages</button>
+      <button type="button" role="tab" id="tab-log" aria-controls="pane-log" aria-selected="false" tabindex="-1">Log</button>
+    </div>
+    <section role="tabpanel" id="pane-comments" aria-labelledby="tab-comments">
+      <form id="comment-form">
+        <div id="comment-target" class="target">Whole document</div>
+        <button type="button" id="comment-clear" class="link" hidden>Comment on the whole document instead</button>
+        <label for="comment-instruction">New comment for the agent</label>
+        <textarea id="comment-instruction" rows="3" required></textarea>
+        <div class="row">
+          <label>Category <select id="comment-category"><option value="format">format</option><option value="text">text</option></select></label>
+          <label>Scope <select id="comment-scope"><option value="document">document</option><option value="house_style">house_style</option></select></label>
+          <button type="submit" id="comment-save">Add comment</button>
+        </div>
+      </form>
+      <div id="comment-list"></div>
+    </section>
+    <section role="tabpanel" id="pane-element" aria-labelledby="tab-element" hidden>
+      <p id="element-empty" class="muted">Click a chart to edit its text fields.</p>
+      <div id="element-fields"></div>
+      <div id="raw-editor" hidden>
+        <h3>Raw text <code class="pointer"></code></h3>
+        <p class="reason muted"></p>
+        <textarea rows="6" aria-label="Raw source text"></textarea>
+        <ul class="issues"></ul>
+        <div class="row"><button type="button" id="raw-save">Save</button> <button type="button" id="raw-cancel">Cancel</button></div>
+      </div>
+    </section>
+    <section role="tabpanel" id="pane-checks" aria-labelledby="tab-checks" hidden>
+      <ul id="check-list"></ul>
+    </section>
+    <section role="tabpanel" id="pane-pages" aria-labelledby="tab-pages" hidden>
+      <p id="pages-empty" class="muted">Press Rebuild to see page previews.</p>
+      <ul id="build-warnings"></ul>
+      <div id="page-previews"></div>
+    </section>
+    <section role="tabpanel" id="pane-log" aria-labelledby="tab-log" hidden>
+      <pre id="log"></pre>
+    </section>
+  </aside>
+</main>
+<dialog id="confirm-dialog" aria-labelledby="confirm-title">
+  <h2 id="confirm-title">Run this agent command?</h2>
+  <p>The editor will run this command in the project directory. It is asked once per command.</p>
+  <pre class="command"></pre>
+  <div class="row"><button type="button" id="confirm-command">Run it</button> <button type="button" class="cancel">Cancel</button></div>
+</dialog>
+<dialog id="lost-edits" aria-labelledby="lost-title">
+  <h2 id="lost-title">The agent overwrote some of your edits</h2>
+  <table>
+    <thead><tr><th>Field</th><th>Your text</th><th>Current text</th><th></th></tr></thead>
+    <tbody></tbody>
+  </table>
+  <div class="row">
+    <button type="button" class="reapply-all">Re-apply my edits</button>
+    <button type="button" class="keep-all">Keep agent's version</button>
+    <button type="button" class="revert">Revert to before the agent run</button>
+    <button type="button" class="close">Close</button>
+  </div>
+</dialog>
+<div id="toasts" aria-live="polite"></div>
 </body>
 </html>
