@@ -1,6 +1,8 @@
 """EditorSession: all editor logic (saving, history, comments, agent and build runs), no HTTP."""
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import math
 import os
@@ -18,7 +20,7 @@ from .history import History
 from .pointer import PointerError, get, iter_strings, set_value
 from .requests import RequestsFile
 from .runner import Busy, CommandFailed, Job, JobRunner
-from .store import SourceStore, SourceUnreadable, StaleSource
+from .store import SourceStore, SourceUnreadable, StaleSource, dumps
 
 __all__ = ["EditorSession", "Locked", "Refused", "StaleSource"]
 
@@ -108,15 +110,17 @@ class EditorSession:
         editor_dir.mkdir(parents=True, exist_ok=True)
         self.store = SourceStore(self.source_path)
         self.requests_file = RequestsFile(self.requests_path)
-        self.history = History(editor_dir / "history", [self.source_path, self.requests_path])
         self.edit_log = EditLog(editor_dir / "edits.json")
+        self.history = History(
+            editor_dir / "history", [self.source_path, self.requests_path, self.edit_log.path]
+        )
 
         self._lock_path = editor_dir / "lock"
         self._owns_lock = False
         self._notices: list[str] = []
         self._job: str | None = None
         self._agent_before: Any = None
-        self._targeted: set[str] = set()
+        self._targeted: list[tuple[str, str]] = []  # (pointer, category)
         self._hash: str | None = None
         self._valid = False
         self._issues: list[Issue] = []
@@ -126,7 +130,7 @@ class EditorSession:
         self._take_lock_file()
         self._reload()
         if self._differs_from_snapshot():
-            self.history.record("open" if self.history.current() is None else "external")
+            self._record("open" if self.history.current() is None else "external")
 
     # -- lifecycle ---------------------------------------------------------
     def _take_lock_file(self) -> None:
@@ -151,30 +155,54 @@ class EditorSession:
         """Re-read the source; keep the last good HTML while it is unreadable or invalid."""
         self._canonical_notice = None
         try:
-            doc, self._hash = self.store.read()
-        except SourceUnreadable as exc:
-            self._hash = self.store.current_hash()
-            self._valid, self._issues = False, [Issue(exc.message)]
+            data = self.source_path.read_bytes()
+        except OSError as exc:
+            self._hash = None
+            message = f"cannot read {self.source_path}: {exc.strerror or exc}"
+            self._valid, self._issues = False, [Issue(message)]
+            return
+        self._hash = hashlib.sha256(data).hexdigest()
+        try:
+            text = data.decode("utf-8")
+            doc = json.loads(text)
+        except (UnicodeDecodeError, ValueError) as exc:
+            self._valid, self._issues = False, [Issue(f"invalid JSON in {self.source_path}: {exc}")]
             return
         self._issues = self.adapter.validate(doc)
         self._valid = not _errors(self._issues)
         if self._valid:
             self._html = self.adapter.render_edit_html(doc, self.project_dir)
-        if not self.store.is_canonical():
+        if dumps(doc, text.endswith("\n")) != text:
             self._canonical_notice = (
                 f"{self.source_path.name} is not in the editor's JSON style; "
                 "the first save will reformat it"
             )
 
+    def _current_hash(self) -> str | None:
+        data = _read_or_none(self.source_path)
+        return None if data is None else hashlib.sha256(data).hexdigest()
+
     def _differs_from_snapshot(self) -> bool:
+        """Whether the source or requests file differs from the current snapshot.
+
+        The edit log is snapshotted with them but ignored here, so accept() never
+        causes a spurious history entry.
+        """
         current = self.history.current()
         if current is None:
             return True
         snap = self.history.directory / current
         return any(
             _read_or_none(path) != _read_or_none(snap / str(i))
-            for i, path in enumerate(self.history.tracked)
+            for i, path in enumerate(self.history.tracked[:2])
         )
+
+    def _record(self, reason: str) -> None:
+        """Record history for a change the session did not write; an unreadable file is skipped."""
+        try:
+            self.history.record(reason)
+        except OSError as exc:
+            log.warning("cannot record history %r: %s", reason, exc)
 
     def _busy(self) -> bool:
         return self._job is not None or self.runner.busy
@@ -285,8 +313,8 @@ class EditorSession:
             issues = self._validate_edit(doc, pointer)
             self.store.write(doc, h)
             figure = self._record_figure(pointer, old, value)
-            self.history.record("edit")
             self.edit_log.record(pointer, value)
+            self.history.record("edit")
             self._reload()
             self._publish_state()
             return {"hash": self._hash, "issues": [asdict(i) for i in issues],
@@ -345,7 +373,10 @@ class EditorSession:
         return config.substitute(settings.command, values), settings.timeout_minutes
 
     def agent_preview(self) -> dict:
-        args, _ = self._agent_command()
+        try:
+            args, _ = self._agent_command()
+        except config.ConfigError as exc:
+            raise Refused([Issue(str(exc))]) from exc
         return {"args": args, "confirmed": config.is_confirmed(args, self._confirm_file)}
 
     def _start_job(self, kind: str, command: Command, timeout_s: float | None, on_exit) -> None:
@@ -375,25 +406,30 @@ class EditorSession:
                 config.confirm(args, self._confirm_file)
             self._poll_locked()
             if self._differs_from_snapshot():
-                self.history.record("external")
+                self._record("external")
             try:
                 self._agent_before = self.store.read()[0]
             except SourceUnreadable:
                 self._agent_before = None
             requests = self.requests_file.load()[0]
-            self._targeted = {
-                r["pointer"] for r in requests
+            self._targeted = [
+                (r["pointer"], r["category"]) for r in requests
                 if r.get("status") == "open" and r.get("category") in ("text", "format")
                 and isinstance(r.get("pointer"), str)
-            }
+            ]
             command = Command(args, Path(self.adapter.agent_cwd(self.project_dir)))
             self._start_job("agent", command, timeout_minutes * 60, self._finish_agent)
 
     def _targeted_entries(self, entries: dict[str, Any]) -> set[str]:
-        """Edited pointers at or under a pointer an open text/format request targets."""
+        """Edited pointers an open request asked to change.
+
+        A text request covers its pointer and everything under it; a format request
+        covers its exact pointer only.
+        """
         return {
             p for p in entries
-            if any(p == t or p.startswith(t + "/") for t in self._targeted)
+            if any(p == t or (category == "text" and p.startswith(t + "/"))
+                   for t, category in self._targeted)
         }
 
     def _apply_moves(self, entries: dict[str, Any], moves: dict[str, str], after: Any) -> list[Lost]:
@@ -430,16 +466,26 @@ class EditorSession:
             self._publish_state()
 
     def _agent_report(self, job: Job) -> dict:
-        if self._differs_from_snapshot():
-            self.history.record("agent")
         self._reload()
         if not self._valid:
-            return {"ok": False, "returncode": job.returncode,
-                    "issues": [asdict(i) for i in self._issues]}
+            if self._differs_from_snapshot():
+                self._record("agent")
+            return {"ok": False, "returncode": job.returncode, "cancelled": job.cancelled,
+                    "timed_out": job.timed_out, "issues": [asdict(i) for i in self._issues]}
         after = self.store.read()[0]
         entries = self.edit_log.entries()
-        lost, moves = survival_check(entries, after, self._targeted_entries(entries))
+        targeted = self._targeted_entries(entries)
+        lost, moves = survival_check(entries, after, targeted)
         lost += self._apply_moves(entries, moves, after)
+        for pointer in targeted:  # the requested change supersedes the direct edit
+            try:
+                if get(after, pointer) == entries[pointer]:
+                    continue
+            except PointerError:
+                pass
+            self.edit_log.forget(pointer)
+        if self._differs_from_snapshot():
+            self._record("agent")
         before = dict(iter_strings(self._agent_before)) if self._agent_before is not None else {}
         changed = [p for p, v in iter_strings(after) if before.get(p) != v]
         return {
@@ -455,6 +501,8 @@ class EditorSession:
     def reapply(self, pointers: list[str]) -> dict:
         with self._lock:
             self._check_unlocked()
+            if not pointers:
+                return {"hash": self._hash, "issues": []}
             doc, h = self._read_for_edit(None)
             entries = self.edit_log.entries()
             for pointer in pointers:
@@ -464,7 +512,7 @@ class EditorSession:
                     set_value(doc, pointer, entries[pointer])
                 except PointerError as exc:
                     raise Refused([Issue(f"this field no longer exists: {exc}", pointer)]) from exc
-            issues = self._validate_edit(doc, pointers[0]) if pointers else []
+            issues = self._validate_edit(doc, pointers[0])
             self.store.write(doc, h)
             self.history.record("edit")
             self._reload()
@@ -473,8 +521,10 @@ class EditorSession:
 
     def accept(self, pointers: list[str]) -> None:
         with self._lock:
+            self._check_unlocked()
             for pointer in pointers:
                 self.edit_log.forget(pointer)
+            self._publish_state()
 
     # -- build -------------------------------------------------------------
     def start_build(self) -> None:
@@ -493,7 +543,7 @@ class EditorSession:
                     "warnings": [asdict(w) for w in result.warnings],
                 }
                 if self._differs_from_snapshot():
-                    self.history.record("build")
+                    self._record("build")
                 self._reload()
             except Exception as exc:
                 log.exception("finishing the build failed")
@@ -509,9 +559,9 @@ class EditorSession:
 
     # -- outside changes ---------------------------------------------------
     def _poll_locked(self) -> bool:
-        if self.store.current_hash() == self._hash:
+        if self._current_hash() == self._hash:
             return False
-        self.history.record("external")
+        self._record("external")
         self._reload()
         self.bus.publish("source-changed", {"hash": self._hash, "valid": self._valid})
         self._publish_state()

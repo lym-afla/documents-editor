@@ -345,3 +345,102 @@ def test_event_bus_unsubscribe():
     b.unsubscribe(q); b.publish("x", 2)
     with pytest.raises(queue.Empty):
         q.get_nowait()
+
+
+# -- review fixes -------------------------------------------------------------
+
+def run_agent(session, bus, fake_agent, **opts):
+    fake_agent(**opts)
+    q = bus.subscribe()
+    session.start_agent(confirm=True)
+    report = wait_event(q, "agent-done")
+    bus.unsubscribe(q)
+    return report
+
+
+def test_targeted_edit_superseded_is_not_lost_on_next_run(session, bus, fake_agent):
+    session.patch("/paragraphs/0", "one 'q'", "mine", session.state()["hash"])
+    session.add_request(pointer="/paragraphs", element="paragraph", quote="mine",
+                        category="text", scope="document", instruction="rewrite")
+    first = run_agent(session, bus, fake_agent,
+                      set_paths={"/paragraphs/0": "rewritten"}, mark_done=True)
+    assert first["lost"] == [] and session.edit_log.entries() == {}
+    assert run_agent(session, bus, fake_agent)["lost"] == []
+
+
+def test_format_request_covers_exact_pointer_only(session, bus, fake_agent):
+    session.patch("/table/0/0", "x", "mine", session.state()["hash"])
+    session.add_request(pointer="/table", element="table", quote="", category="format",
+                        scope="document", instruction="right-align")
+    report = run_agent(session, bus, fake_agent, set_paths={"/table/0/0": "gone"})
+    assert [l["pointer"] for l in report["lost"]] == ["/table/0/0"]
+
+
+def test_undo_rolls_back_edit_log(session, bus, fake_agent):
+    session.patch("/title", "T", "T2", session.state()["hash"])
+    session.undo()
+    assert session.edit_log.entries() == {}
+    assert run_agent(session, bus, fake_agent)["lost"] == []
+    session.redo()
+    assert session.edit_log.entries() == {"/title": "T2"}
+
+
+def test_revert_after_agent_restores_edit_log(session, bus, fake_agent):
+    session.patch("/paragraphs/0", "one 'q'", "mine", session.state()["hash"])
+    run_agent(session, bus, fake_agent,
+              set_paths={"/paragraphs/0": "x", "/chart/labels/0": "mine"})
+    assert session.edit_log.entries() == {"/chart/labels/0": "mine"}
+    session.undo()
+    assert session.edit_log.entries() == {"/paragraphs/0": "mine"}
+    assert session.value("/paragraphs/0")["value"] == "mine"
+
+
+def test_accept_does_not_create_history_entry(session, bus, fake_agent):
+    session.patch("/title", "T", "T2", session.state()["hash"])
+    count = len(session.history.entries())
+    q = bus.subscribe()
+    session.accept(["/title"])
+    assert wait_event(q, "state")["can_undo"]
+    run_agent(session, bus, fake_agent)
+    assert len(session.history.entries()) == count
+
+
+def test_accept_locked_and_empty_reapply_is_noop(session, fake_agent, doc_path):
+    before = doc_path.read_bytes(); count = len(session.history.entries())
+    assert session.reapply([])["hash"] == session.state()["hash"]
+    assert doc_path.read_bytes() == before and len(session.history.entries()) == count
+    fake_agent(sleep=5); session.start_agent(confirm=True)
+    with pytest.raises(Locked):
+        session.accept(["/title"])
+
+
+def test_agent_preview_wraps_config_error(session, tmp_path):
+    (tmp_path / "cfg.toml").write_text('[agent.simple]\ncommand = ["{nope}"]\n')
+    with pytest.raises(Refused):
+        session.agent_preview()
+
+
+def test_broken_agent_report_has_cancel_flags(session, bus, fake_agent):
+    report = run_agent(session, bus, fake_agent, write_raw="{")
+    assert report["ok"] is False and report["cancelled"] is False and report["timed_out"] is False
+
+
+def test_source_that_is_a_directory_does_not_crash(doc_path, make_session):
+    doc_path.unlink(); doc_path.mkdir()
+    s = make_session()
+    assert s.state()["valid"] is False and s.state()["issues"]
+    assert s.poll_external() is False
+
+
+@pytest.mark.skipif(sys.platform == "win32" or getattr(__import__("os"), "geteuid", lambda: 1)() == 0,
+                    reason="permission bits do not block reading here")
+def test_unreadable_source_starts_invalid_and_poll_never_raises(doc_path, make_session, session):
+    doc_path.chmod(0)
+    try:
+        assert session.poll_external() is True  # the readable file became unreadable
+        assert session.state()["valid"] is False
+        assert session.poll_external() is False
+        s = make_session()
+        assert s.state()["valid"] is False
+    finally:
+        doc_path.chmod(0o644)
