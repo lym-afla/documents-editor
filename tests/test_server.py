@@ -48,6 +48,7 @@ class Srv:
     base: str
     host: str
     session: EditorSession
+    port: int = 0
 
 
 def request(srv, method, path, *, token=False, headers=None, data=None, raw=None):
@@ -92,7 +93,7 @@ def server(project_dir):
     assert url == f"http://127.0.0.1:{port}/?t={TOKEN}"
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
-    yield Srv(f"http://127.0.0.1:{port}", f"127.0.0.1:{port}", session)
+    yield Srv(f"http://127.0.0.1:{port}", f"127.0.0.1:{port}", session, port)
     httpd.shutdown()
     httpd.server_close()
     thread.join(5)
@@ -124,11 +125,11 @@ def test_index_sets_cookie_and_static_needs_no_token(server):
     r = get(server, f"/?t={TOKEN}")
     assert r.status == 200 and "Document editor" in r.text
     cookie = r.headers["Set-Cookie"]
-    assert cookie.startswith(f"de_token={TOKEN}") and "HttpOnly" in cookie
+    assert cookie.startswith(f"de_token_{server.port}={TOKEN}") and "HttpOnly" in cookie
     assert "SameSite=Strict" in cookie and "Path=/" in cookie
     assert r.headers["Cache-Control"] == "no-store"
     # the cookie alone authorises later calls
-    assert get(server, "/api/state", headers={"Cookie": f"de_token={TOKEN}"}).status == 200
+    assert get(server, "/api/state", headers={"Cookie": f"de_token_{server.port}={TOKEN}"}).status == 200
     js = get(server, "/static/page.js")
     assert js.status == 200 and js.headers["Content-Type"].startswith("text/javascript")
     assert get(server, "/static/page.css").headers["Content-Type"].startswith("text/css")
@@ -304,3 +305,64 @@ def test_server_close_does_not_hang_with_open_sse(project_dir):
     assert time.monotonic() - started < 5
     conn.close()
     session.close()
+
+
+def test_adapter_errors_are_500_but_request_errors_are_404_422(server, monkeypatch):
+    def boom(source, pointer):
+        raise KeyError("x")
+    monkeypatch.setattr(server.session.adapter, "panel_fields", boom)
+    r = get(server, "/api/fields?pointer=/chart", token=True)
+    assert r.status == 500 and r.json["error"].startswith("KeyError")
+    assert request(server, "DELETE", "/api/requests/nope", token=True).status == 404
+
+
+def test_request_patch_accepts_only_whitelisted_string_fields(server):
+    rid = post_json(server, "/api/requests", {
+        "pointer": None, "element": "e", "quote": "q", "category": "text",
+        "scope": "document", "instruction": "i"}).json["id"]
+    for body in ({"id": "x"}, {"instruction": 5}, {"quote": "z"}):
+        assert request(server, "PATCH", f"/api/requests/{rid}", token=True, data=body).status == 400
+    assert request(server, "PATCH", f"/api/requests/{rid}", token=True, data={"status": "done"}).status == 200
+
+
+def test_hostile_neighbouring_cookie_does_not_lock_out(server):
+    name = f"de_token_{server.port}"
+    cookie = f'x={{"a":1}}; {name}="{TOKEN}"; y=2'
+    assert get(server, "/api/state", headers={"Cookie": cookie}).status == 200
+    assert get(server, "/api/state", headers={"Cookie": f'x=1; {name}=bad'}).status == 403
+
+
+def test_cookie_names_are_per_port(server, project_dir, tmp_path):
+    other_dir = tmp_path / "other"
+    other_dir.mkdir()
+    (other_dir / "doc.json").write_text(json.dumps(DOC), encoding="utf-8")
+    session = EditorSession(SimpleDocAdapter(), other_dir, bus=EventBus(), runner=JobRunner())
+    httpd, _ = make_server(session, token="other-token")
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        port = httpd.server_address[1]
+        other = Srv(f"http://127.0.0.1:{port}", f"127.0.0.1:{port}", session, port)
+        c1 = get(server, f"/?t={TOKEN}").headers["Set-Cookie"].split(";")[0]
+        c2 = get(other, "/?t=other-token").headers["Set-Cookie"].split(";")[0]
+        assert c1.split("=")[0] != c2.split("=")[0]
+        both = f"{c1}; {c2}"
+        assert get(server, "/api/state", headers={"Cookie": both}).status == 200
+        assert get(other, "/api/state", headers={"Cookie": both}).status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        session.close()
+
+
+def test_editor_dir_is_hidden_case_insensitively(server, project_dir):
+    (project_dir / ".editor" / "x.txt").write_text("s")
+    for name in (".editor/x.txt", ".EDITOR/x.txt", ".editor./x.txt"):
+        assert get(server, "/project/" + name, token=True).status == 404, name
+
+
+def test_run_releases_lock_when_port_is_taken(server, project_dir):
+    from documents_editor import app
+    with pytest.raises(OSError):
+        app.run(SimpleDocAdapter(), project_dir, port=server.port, open_browser=False)
+    # the fixture session owns the lock; the failed run must not have removed it
+    assert (project_dir / ".editor" / "lock").exists()

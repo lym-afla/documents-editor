@@ -28,19 +28,21 @@ def run(adapter: Adapter, project_dir: Path, *, port: int = 0, open_browser: boo
     project_dir = Path(project_dir).resolve()
     runner = JobRunner()
     session = EditorSession(adapter, project_dir, bus=EventBus(), runner=runner)
-    server, url = make_server(session, port=port)
-    print(f"Editor: {url}", flush=True)
-    print(f"Agent config: {config.config_path()}", flush=True)
     stop = threading.Event()
-    threading.Thread(target=_poll_loop, args=(session, stop), daemon=True).start()
-    if open_browser:
-        webbrowser.open(url)
+    server = None
     try:
+        server, url = make_server(session, port=port)
+        print(f"Editor: {url}", flush=True)
+        print(f"Agent config: {config.config_path()}", flush=True)
+        threading.Thread(target=_poll_loop, args=(session, stop), daemon=True).start()
+        if open_browser:
+            webbrowser.open(url)
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
         stop.set()
         runner.cancel()
-        server.server_close()
+        if server is not None:
+            server.server_close()
         session.close()

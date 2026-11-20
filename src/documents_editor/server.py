@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import mimetypes
 import queue
 import re
@@ -10,7 +11,6 @@ import threading
 import time
 from dataclasses import asdict
 from http import HTTPStatus
-from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib import resources
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -24,7 +24,8 @@ from .store import SourceUnreadable
 
 MAX_BODY = 5 * 1024 * 1024
 HEARTBEAT_SECONDS = 15
-COOKIE = "de_token"
+_UPDATABLE = ("instruction", "scope", "category", "status")
+log = logging.getLogger(__name__)
 DENIED = "Open the editor from the URL printed in the terminal"
 _CONTENT_TYPES = {
     ".html": "text/html; charset=utf-8",
@@ -41,13 +42,36 @@ class BadRequest(Exception):
     pass
 
 
+class NotFound(Exception):
+    pass
+
+
+class Invalid(Exception):
+    pass
+
+
+def _request_errors(call, *args, **kw):
+    """Run a requests-file call; only here do KeyError and ValueError mean 404 and 422."""
+    try:
+        return call(*args, **kw)
+    except KeyError as exc:
+        raise NotFound(str(exc)) from exc
+    except ValueError as exc:
+        raise Invalid(str(exc)) from exc
+
+
 class _Server(ThreadingHTTPServer):
     daemon_threads = True
 
     session: EditorSession
     token: str
+    cookie_name: str
     allowed_hosts: frozenset[str]
     stopping: threading.Event
+
+    def __init__(self, *args: Any, **kw: Any) -> None:
+        self.stopping = threading.Event()  # before bind: a failed bind calls server_close
+        super().__init__(*args, **kw)
 
     def server_close(self) -> None:
         self.stopping.set()  # lets open SSE handlers return
@@ -128,13 +152,12 @@ class Handler(BaseHTTPRequestHandler):
     def _authorised(self, query_token: str | None = None) -> bool:
         expected = self.server.token
         candidates = [self.headers.get("X-Editor-Token"), query_token]
-        cookies = SimpleCookie()
-        try:
-            cookies.load(self.headers.get("Cookie", ""))
-        except Exception:
-            pass
-        if COOKIE in cookies:
-            candidates.append(cookies[COOKIE].value)
+        name = self.server.cookie_name
+        for header in self.headers.get_all("Cookie") or []:
+            for item in header.split(";"):
+                key, sep, value = item.partition("=")
+                if sep and key.strip() == name:
+                    candidates.append(value.strip().strip('"'))
         return any(
             c is not None and secrets.compare_digest(c.encode("utf-8"), expected.encode("utf-8"))
             for c in candidates
@@ -229,9 +252,9 @@ class Handler(BaseHTTPRequestHandler):
             return 409, {"error": "unreadable", "message": exc.message}
         if isinstance(exc, PointerError):
             return 404, {"error": "no such field"}
-        if isinstance(exc, KeyError):
+        if isinstance(exc, NotFound):
             return 404, {"error": "not found"}
-        if isinstance(exc, ValueError):
+        if isinstance(exc, Invalid):
             return 422, {"error": "invalid", "message": str(exc)}
         return 500, {"error": f"{type(exc).__name__}: {exc}"}
 
@@ -241,7 +264,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._text(HTTPStatus.FORBIDDEN, DENIED)
         body = self._static_bytes("index.html")
         assert body is not None
-        cookie = f"{COOKIE}={self.server.token}; HttpOnly; SameSite=Strict; Path=/"
+        cookie = f"{self.server.cookie_name}={self.server.token}; HttpOnly; SameSite=Strict; Path=/"
         self._send(200, body, _CONTENT_TYPES[".html"], [("Set-Cookie", cookie)])
 
     @staticmethod
@@ -279,8 +302,11 @@ class Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/requests/") and method in ("PATCH", "DELETE"):
             request_id = unquote(path[len("/api/requests/"):])
             if method == "PATCH":
-                return self._json(200, s.update_request(request_id, **self._body()))
-            s.delete_request(request_id)
+                body = self._body()
+                if not all(k in _UPDATABLE and isinstance(v, str) for k, v in body.items()):
+                    raise BadRequest(f"only string fields {list(_UPDATABLE)} can be updated")
+                return self._json(200, _request_errors(s.update_request, request_id, **body))
+            _request_errors(s.delete_request, request_id)
             return self._json(200, {"ok": True})
 
         key = (method, path)
@@ -311,14 +337,14 @@ class Handler(BaseHTTPRequestHandler):
             pointer_value = body.get("pointer")
             if pointer_value is not None and not isinstance(pointer_value, str):
                 raise BadRequest("invalid 'pointer'")
-            return self._json(200, s.add_request(
+            return self._json(200, _request_errors(
+                s.add_request,
                 pointer=pointer_value, element=self._field(body, "element"),
                 quote=self._field(body, "quote"), category=self._field(body, "category"),
                 scope=self._field(body, "scope"), instruction=self._field(body, "instruction"),
             ))
         if key == ("GET", "/api/fields"):
-            doc = s.store.read()[0]
-            return self._json(200, s.adapter.panel_fields(doc, pointer))
+            return self._json(200, s.fields(pointer))
         if key == ("GET", "/api/agent"):
             return self._json(200, s.agent_preview())
         if key == ("POST", "/api/agent"):
@@ -356,7 +382,8 @@ class Handler(BaseHTTPRequestHandler):
                 inside = candidate.relative_to(root).parts
             except ValueError:
                 inside = ()
-            if inside and inside[0] != ".editor" and candidate.is_file():
+            hidden = inside and inside[0].rstrip(". ").casefold() == ".editor"
+            if inside and not hidden and candidate.is_file():
                 target = candidate
         if target is None:
             return self._json(404, {"error": "not found"})
@@ -367,8 +394,7 @@ class Handler(BaseHTTPRequestHandler):
         self._send(200, body, _content_type(target.name))
 
     def _page(self, name: str) -> None:
-        result = self.session.adapter.build_result(self.session.project_dir)
-        target = next((Path(p) for p in result.pages if Path(p).name == name), None)
+        target = self.session.page_path(name)
         try:
             body = target.read_bytes() if target is not None else None
         except OSError:
@@ -403,6 +429,8 @@ class Handler(BaseHTTPRequestHandler):
                 last = time.monotonic()
         except _DISCONNECTED:
             pass
+        except Exception:
+            log.exception("event stream failed")
         finally:
             bus.unsubscribe(q)
 
@@ -419,6 +447,6 @@ def make_server(
     bound = server.server_address[1]
     server.session = session
     server.token = token or secrets.token_urlsafe(24)
+    server.cookie_name = f"de_token_{bound}"
     server.allowed_hosts = frozenset({f"127.0.0.1:{bound}", f"localhost:{bound}"})
-    server.stopping = threading.Event()
     return server, f"http://127.0.0.1:{bound}/?t={server.token}"

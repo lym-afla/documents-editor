@@ -248,6 +248,24 @@ class EditorSession:
             doc, h = self.store.read()
             return {"value": get(doc, pointer), "hash": h}
 
+    def fields(self, pointer: str) -> list[dict]:
+        with self._lock:
+            doc, _ = self.store.read()
+            return self.adapter.panel_fields(doc, pointer)
+
+    def page_path(self, name: str) -> Path | None:
+        """A page of the latest build result, by file name, if it lies inside the project."""
+        with self._lock:
+            root = self.project_dir.resolve()
+            for page in self.adapter.build_result(self.project_dir).pages:
+                page = Path(page)
+                if page.name != name:
+                    continue
+                resolved = page.resolve()
+                if resolved.is_relative_to(root) and resolved.is_file():
+                    return resolved
+            return None
+
     def check(self, pointer: str, value: str) -> list[Issue]:
         return self.adapter.check_text(pointer, value)
 
