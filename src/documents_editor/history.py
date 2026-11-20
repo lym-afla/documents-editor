@@ -6,11 +6,18 @@ import os
 import re
 import shutil
 import tempfile
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .store import atomic_write_text
+
+_STAMP_FORMAT = "%Y%m%d-%H%M%S-%f"
+_STAMP_LEN = 22
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class History:
@@ -42,33 +49,31 @@ class History:
 
     def record(self, reason: str) -> str:
         self.directory.mkdir(parents=True, exist_ok=True)
-        now = datetime.now()
+        now = _now()
+        if self._entries:
+            last = datetime.strptime(self._entries[-1]["id"][:_STAMP_LEN], _STAMP_FORMAT)
+            last = last.replace(tzinfo=timezone.utc)
+            now = max(now, last + timedelta(microseconds=1))
         slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", reason).strip("-") or "entry"
-        stamp = now.strftime("%Y%m%d-%H%M%S-%f")
-        last = self._entries[-1]["id"] if self._entries else ""
-        counter = 0
-        while True:
-            suffix = f"-{counter:04d}" if counter else ""
-            snap_id = f"{stamp}{suffix}-{slug}"
-            if not (self.directory / snap_id).exists() and snap_id > last:
-                break
-            counter += 1
+        while (self.directory / f"{now.strftime(_STAMP_FORMAT)}-{slug}").exists():
+            now += timedelta(microseconds=1)
+        snap_id = f"{now.strftime(_STAMP_FORMAT)}-{slug}"
         snap = self.directory / snap_id
         snap.mkdir()
         for i, path in enumerate(self.tracked):
             if path.exists():
                 shutil.copyfile(path, snap / str(i))
-        for dropped in self._entries[self._cursor + 1:]:
-            shutil.rmtree(self.directory / dropped["id"], ignore_errors=True)
+        removed = self._entries[self._cursor + 1:]
         self._entries = self._entries[: self._cursor + 1]
         self._entries.append(
             {"id": snap_id, "reason": reason, "time": now.isoformat(timespec="microseconds")}
         )
         while len(self._entries) > self.cap:
-            old = self._entries.pop(0)
-            shutil.rmtree(self.directory / old["id"], ignore_errors=True)
+            removed.append(self._entries.pop(0))
         self._cursor = len(self._entries) - 1
         self._save()
+        for old in removed:
+            shutil.rmtree(self.directory / old["id"], ignore_errors=True)
         return snap_id
 
     def undo(self) -> str | None:
@@ -84,6 +89,8 @@ class History:
     def _move(self, cursor: int) -> str:
         snap_id = self._entries[cursor]["id"]
         snap = self.directory / snap_id
+        if not snap.is_dir():
+            raise FileNotFoundError(f"history snapshot is missing: {snap}")
         for i, path in enumerate(self.tracked):
             saved = snap / str(i)
             if saved.exists():

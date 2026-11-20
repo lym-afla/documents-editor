@@ -39,3 +39,46 @@ def test_invalid_json_bytes_round_trip_and_ids_unique_sorted(tmp_path, monkeypat
     h.record("edit")
     assert h.undo() == ids[-1] and src.read_bytes() == b'{"broken": \xff\xfe'
     assert h.can_undo and h.can_redo and h.current() == ids[-1]
+
+
+def _frozen(monkeypatch, *times):
+    from datetime import datetime, timezone
+    from documents_editor import history
+    it = iter(times)
+    last = []
+    def now():
+        try:
+            last[:] = [next(it)]
+        except StopIteration:
+            pass
+        return datetime(2026, 1, 1, 0, 0, 0, last[0], tzinfo=timezone.utc)
+    monkeypatch.setattr(history, "_now", now)
+
+
+def test_frozen_clock_with_different_slugs_terminates(tmp_path, monkeypatch):
+    _frozen(monkeypatch, 5)
+    src = tmp_path / "doc.json"; src.write_text("x")
+    h = History(tmp_path / "h", [src])
+    ids = [h.record(r) for r in ("edit", "agent", "zzz", "agent")]
+    assert ids == sorted(ids) and len(set(ids)) == 4
+
+
+def test_clock_going_backwards_keeps_ids_sorted(tmp_path, monkeypatch):
+    _frozen(monkeypatch, 500, 100, 50)
+    src = tmp_path / "doc.json"; src.write_text("x")
+    h = History(tmp_path / "h", [src])
+    ids = [h.record("edit") for _ in range(3)]
+    assert ids == sorted(ids) and len(set(ids)) == 3
+    assert History(tmp_path / "h", [src]).current() == ids[-1]
+
+
+def test_missing_snapshot_dir_raises_and_leaves_files(tmp_path):
+    import shutil
+    import pytest
+    src = tmp_path / "doc.json"; src.write_text("v0")
+    h = History(tmp_path / "h", [src]); first = h.record("open")
+    src.write_text("v1"); h.record("edit")
+    shutil.rmtree(tmp_path / "h" / first)
+    with pytest.raises(FileNotFoundError):
+        h.undo()
+    assert src.read_text() == "v1" and h.current() != first and h.can_undo
