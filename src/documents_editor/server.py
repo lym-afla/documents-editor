@@ -35,6 +35,13 @@ _CONTENT_TYPES = {
     ".svg": "image/svg+xml",
     ".json": "application/json",
 }
+# Document pages and project files: no inline script, no remote loads, no form posts.
+DOC_CSP = (
+    "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; font-src 'self' data:; connect-src 'self'; "
+    "frame-ancestors 'self'; base-uri 'self'; form-action 'none'"
+)
+_SAFE_METHODS = ("GET", "HEAD")
 _DISCONNECTED = (BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)
 
 
@@ -163,6 +170,12 @@ class Handler(BaseHTTPRequestHandler):
             for c in candidates
         )
 
+    def _header_token_ok(self) -> bool:
+        """State-changing calls need the token in a header: the cookie alone is not enough."""
+        supplied = self.headers.get("X-Editor-Token")
+        return supplied is not None and secrets.compare_digest(
+            supplied.encode("utf-8"), self.server.token.encode("utf-8"))
+
     def _discard(self, length: int) -> None:
         """Read and drop an oversized body so the client can receive the 400."""
         remaining = min(max(length, 0), 8 * MAX_BODY)
@@ -229,6 +242,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self._index(query)
             if not self._authorised():
                 return self._text(HTTPStatus.FORBIDDEN, DENIED)
+            if self.command not in _SAFE_METHODS and not self._header_token_ok():
+                return self._text(HTTPStatus.FORBIDDEN, "Missing X-Editor-Token header")
             self._route(path, query)
         except _DISCONNECTED:
             self.close_connection = True
@@ -294,7 +309,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/events" and method == "GET":
             return self._events()
         if path == "/doc" and method == "GET":
-            return self._send(200, _inject_assets(s.page_html()).encode("utf-8"), _CONTENT_TYPES[".html"])
+            return self._send(200, _inject_assets(s.page_html()).encode("utf-8"), _CONTENT_TYPES[".html"],
+                              [("Content-Security-Policy", DOC_CSP)])
         if path.startswith("/project/") and method == "GET":
             return self._project(path[len("/project/"):])
         if path.startswith("/api/pages/") and method == "GET":
@@ -391,7 +407,7 @@ class Handler(BaseHTTPRequestHandler):
             body = target.read_bytes()
         except OSError:
             return self._json(404, {"error": "not found"})
-        self._send(200, body, _content_type(target.name))
+        self._send(200, body, _content_type(target.name), [("Content-Security-Policy", DOC_CSP)])
 
     def _page(self, name: str) -> None:
         target = self.session.page_path(name)

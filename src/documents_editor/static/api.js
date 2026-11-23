@@ -1,6 +1,16 @@
-// Same-origin JSON calls; the session cookie authorises them.
+// Same-origin JSON calls. The session cookie authorises reads; state-changing calls also need
+// the token in a header, which only the shell holds (set once from its start URL).
+let token = null;
+
+export function setToken(value) {
+  token = value;
+}
+
+export const hasToken = () => token !== null;
+
 export async function api(method, path, body) {
   const options = { method, credentials: "same-origin", headers: {} };
+  if (token !== null && method !== "GET") options.headers["X-Editor-Token"] = token;
   if (body !== undefined) {
     options.headers["Content-Type"] = "application/json";
     options.body = JSON.stringify(body);

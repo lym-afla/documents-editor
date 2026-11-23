@@ -23,6 +23,27 @@ function post(message) {
   if (shell !== window) shell.postMessage(message, location.origin);
 }
 
+// Saves and checks go through the shell: only it holds the token their header needs.
+const SHELL_TIMEOUT_MS = 30000;
+let shellSeq = 0;
+const shellWaiting = new Map();
+
+function shellApi(path, body) {
+  if (shell === window) return api("POST", path, body); // opened on its own: the server refuses
+  const id = ++shellSeq;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      shellWaiting.delete(id);
+      resolve({ status: 0, data: { error: "network", message: "The editor did not answer" } });
+    }, SHELL_TIMEOUT_MS);
+    shellWaiting.set(id, (result) => {
+      clearTimeout(timer);
+      resolve(result);
+    });
+    post({ type: "api", id, method: "POST", path, body });
+  });
+}
+
 const sourceOf = (node) => (node instanceof Element ? node : node?.parentElement)?.closest("[data-src]") ?? null;
 const elementName = (el) => (el ? el.localName : "document");
 const cut = (text) => text.replace(/\s+/g, " ").trim().slice(0, QUOTE_MAX);
@@ -302,7 +323,7 @@ function commit() {
 }
 
 async function save(e, markup) {
-  const r = await api("POST", "/api/patch", { pointer: e.pointer, old: e.original, new: markup, source_hash: e.hash });
+  const r = await shellApi("/api/patch", { pointer: e.pointer, old: e.original, new: markup, source_hash: e.hash });
   if (r.status === 200) {
     // saved, even if the user pressed Esc meanwhile: the page must show the file, but not
     // by reloading under another edit the user has since started
@@ -352,7 +373,7 @@ async function runCheck() {
   const result = fromDom(e.el, e.kind, e.raw);
   const value = result.ok ? result.markup : e.el.textContent;
   const seq = ++checkSeq;
-  const r = await api("POST", "/api/check", { pointer: e.pointer, value });
+  const r = await shellApi("/api/check", { pointer: e.pointer, value });
   if (seq !== checkSeq || edit !== e) return;
   const local = (result.ok ? result.issues : [result.reason]).map((message) => ({ message, severity: "warning", pointer: e.pointer }));
   const issues = [...local, ...(r.status === 200 ? r.data.issues : [])];
@@ -448,6 +469,10 @@ const handlers = {
   },
   reveal(m) {
     reveal(m.pointer);
+  },
+  "api-result"(m) {
+    shellWaiting.get(m.id)?.({ status: m.status, data: m.data });
+    shellWaiting.delete(m.id);
   },
 };
 

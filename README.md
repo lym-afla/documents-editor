@@ -27,7 +27,8 @@ uv run python -m documents_editor --adapter examples.simple_doc:SimpleDocAdapter
 ```
 
 Options: `--port N` (default: a random free port) and `--no-browser`. The command prints
-the editor URL (with its access token) and the path of the user config file. Projects
+the editor URL (with its access token), the path of the user config file and the agent
+command that **Send to agent** would run. Projects
 built on a document generator usually wrap this, e.g. `cli.py edit PROJECT_DIR`.
 
 The editor writes only the source JSON, `PROJECT_DIR/edit_requests.json` (comments) and
@@ -75,10 +76,28 @@ config file.
 
 ## Security model
 
-- The server binds to `127.0.0.1` only. For remote use, tunnel the port over SSH.
+- The server binds to `127.0.0.1` only. For remote use, tunnel the port over SSH and keep
+  the same port number on both ends (`ssh -L 8765:127.0.0.1:8765 host`, then start the
+  editor with `--port 8765`): the server accepts only `Host: 127.0.0.1:<port>` or
+  `localhost:<port>` for its own port.
 - Every API call needs the random session token. Opening the printed URL (`/?t=<token>`)
   sets an `HttpOnly`, `SameSite=Strict` cookie named `de_token_<port>`, so editors on
-  different ports never share or overwrite each other's token.
+  different ports never share or overwrite each other's token. The cookie authorises reads
+  only.
+- State-changing calls (`POST`, `PATCH`, `DELETE`: saves, comments, undo, agent and build
+  runs) also need the token in an `X-Editor-Token` header. The editor shell reads the token
+  from its start URL once, keeps it in a module variable and removes it from the address
+  bar. The document page saves and checks text by asking the shell over `postMessage`; the
+  shell forwards only those two calls, so the page cannot start the agent, confirm a
+  command or change comments. This is defence in depth: the page shares the shell's origin,
+  so the policy below, which stops script in document text from running at all, is the
+  main guard. After a browser reload the token is gone: open the printed
+  URL again to keep editing.
+- The document page (`/doc`) and project files (`/project/…`) are sent with a
+  Content-Security-Policy that allows scripts, styles, images, fonts and connections from
+  the editor itself only (plus inline styles and `data:` images and fonts), forbids form
+  posts and framing by other sites. Script that ends up inside document text (`<script>`,
+  `onerror=` attributes) does not run, and a document cannot load remote resources.
 - Requests with a foreign `Host` or `Origin` header are refused, so other local web pages
   cannot drive the editor.
 - Project files are served only from inside the project directory, never `.editor/`.

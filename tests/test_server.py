@@ -366,3 +366,25 @@ def test_run_releases_lock_when_port_is_taken(server, project_dir):
         app.run(SimpleDocAdapter(), project_dir, port=server.port, open_browser=False)
     # the fixture session owns the lock; the failed run must not have removed it
     assert (project_dir / ".editor" / "lock").exists()
+
+
+def test_document_and_project_files_carry_the_csp(server, project_dir):
+    from documents_editor.server import DOC_CSP
+
+    (project_dir / "logo.png").write_bytes(b"\x89PNG")
+    for path in ("/doc", "/project/logo.png"):
+        r = get(server, path, token=True)
+        assert r.status == 200 and r.headers["Content-Security-Policy"] == DOC_CSP, path
+    assert "script-src 'self';" in DOC_CSP and "form-action 'none'" in DOC_CSP
+    assert "img-src 'self' data:;" in DOC_CSP  # no remote images
+
+
+def test_state_changing_calls_need_the_token_header_not_just_the_cookie(server):
+    cookie = {"Cookie": f"de_token_{server.port}={TOKEN}"}
+    assert get(server, "/api/state", headers=cookie).status == 200  # reads: the cookie is enough
+    for method, path in (("POST", "/api/undo"), ("POST", "/api/agent"), ("POST", "/api/check"),
+                         ("PATCH", "/api/requests/x"), ("DELETE", "/api/requests/x")):
+        r = request(server, method, path, headers=cookie, data={})
+        assert r.status == 403 and "X-Editor-Token" in r.text, (method, path)
+    assert request(server, "POST", "/api/undo", headers={**cookie, "X-Editor-Token": "no"}).status == 403
+    assert post(server, "/api/undo", token=True).status == 200

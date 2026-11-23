@@ -1,5 +1,5 @@
 // Editor shell: top bar, state from server-sent events, and the bridge to the page in the iframe.
-import { api, errorText } from "./api.js";
+import { api, errorText, hasToken, setToken } from "./api.js";
 import { $, h, show, toast } from "./ui.js";
 import * as agent from "./agent.js";
 import * as comments from "./comments.js";
@@ -8,6 +8,14 @@ import * as panel from "./panel.js";
 const FIGURE_TOAST = "Figure changed – the agent will reconcile facts and calculations";
 const UNFINISHED = "Finish or cancel the edit first";
 const iframe = $("#doc");
+const PAGE_CALLS = new Set(["/api/patch", "/api/check"]); // what the page may ask the shell to send
+
+// The token stays in this module only: drop it from the address bar and history.
+const startToken = new URLSearchParams(location.search).get("t");
+if (startToken) {
+  setToken(startToken);
+  history.replaceState(null, "", "/");
+}
 
 const ctx = {
   state: null,
@@ -147,13 +155,23 @@ const pageHandlers = {
   marker(m) {
     comments.reveal(m.pointer);
   },
+  // The page saves and checks through the shell, which adds the token header.
+  async api(m, source) {
+    const allowed = m.method === "POST" && PAGE_CALLS.has(m.path);
+    const r = allowed
+      ? await api("POST", m.path, m.body)
+      : { status: 403, data: { error: "forbidden", message: "Not allowed from the page" } };
+    if (source === iframe.contentWindow) {
+      source.postMessage({ type: "api-result", id: m.id, status: r.status, data: r.data }, location.origin);
+    }
+  },
 };
 
 window.addEventListener("message", (event) => {
   if (event.origin !== location.origin || event.source !== iframe.contentWindow) return;
   const m = event.data;
   if (!m || typeof m.type !== "string" || !Object.hasOwn(pageHandlers, m.type)) return;
-  pageHandlers[m.type](m);
+  pageHandlers[m.type](m, event.source);
 });
 
 // -- server state -------------------------------------------------------------
@@ -249,6 +267,7 @@ $("#cancel-job").addEventListener("click", async () => {
 $("#outside-banner .reload").addEventListener("click", () => ctx.reloadDoc());
 $("#invalid-banner .revert").addEventListener("click", () => ctx.undo());
 
+if (!hasToken()) show($("#token-banner"), true);
 panel.init(ctx);
 comments.init(ctx);
 agent.init(ctx);
