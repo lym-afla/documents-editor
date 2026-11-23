@@ -52,10 +52,17 @@ def _coerce(old: Any, new: str) -> Any:
     text = new.strip()
     if not _NUMBER.fullmatch(text):
         return new
-    if re.fullmatch(r"-?\d+", text):
+    if re.fullmatch(r"-?\d+", text) and not isinstance(old, float):
         return int(text)
     value = float(text)
     return value if math.isfinite(value) else new
+
+
+def _text(value: Any) -> str:
+    """Document value as text; numbers keep their JSON form (407.0 stays 407.0)."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return json.dumps(value)
+    return str(value)
 
 
 def _read_or_none(path: Path) -> bytes | None:
@@ -301,13 +308,13 @@ class EditorSession:
              and r.get("status") == "open" and r.get("pointer") == pointer),
             None,
         )
-        base = str(existing["old"]) if existing and "old" in existing else str(old)
-        note = self.adapter.figure_change(pointer, base, str(new))
+        base = str(existing["old"]) if existing and "old" in existing else _text(old)
+        note = self.adapter.figure_change(pointer, base, _text(new))
         if note is None and existing is None:
             return None
         try:
             return self.requests_file.upsert_figure(
-                pointer=pointer, old=str(old), new=str(new), quote=str(new),
+                pointer=pointer, old=_text(old), new=_text(new), quote=_text(new),
                 note=note or existing.get("instruction", ""),
             )
         except ValueError:
@@ -330,7 +337,7 @@ class EditorSession:
             set_value(doc, pointer, value)
             issues = self._validate_edit(doc, pointer)
             self.store.write(doc, h)
-            figure = self._record_figure(pointer, old, value)
+            figure = self._record_figure(pointer, current, value)
             self.edit_log.record(pointer, value)
             self.history.record("edit")
             self._reload()

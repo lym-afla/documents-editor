@@ -139,6 +139,16 @@ def test_number_cell_and_figure_request(session):
     assert r["figure_request"]["old"] == "2" and session.state()["open_requests"] == 1
 
 
+def test_float_cell_keeps_float_and_figure_note_uses_document_value(make_session, doc_path):
+    write_doc(doc_path, dict(DOC, table=[["x", 407.0]]))
+    session = make_session()
+    r = session.patch("/table/0/1", 407, "412.5", session.state()["hash"])  # the client sends 407
+    assert r["figure_request"]["old"] == "407.0" and r["figure_request"]["new"] == "412.5"
+    assert "407.0 -> 412.5" in r["figure_request"]["instruction"]
+    session.patch("/table/0/1", 412.5, "412", session.state()["hash"])
+    assert '"table": [\n    [\n      "x",\n      412.0\n' in doc_path.read_text(encoding="utf-8")
+
+
 def test_agent_run_reports_changes_and_lost_edits(session, bus, fake_agent):
     h = session.state()["hash"]; session.patch("/paragraphs/0", "one 'q'", "mine", h)
     fake_agent(set_paths={"/paragraphs/0": "regenerated", "/title": "New"}, mark_done=True)
