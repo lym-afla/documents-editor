@@ -17,7 +17,7 @@ from .adapter import Adapter, Command, Issue
 from .edits import EditLog, Lost, survival_check
 from .events import EventBus
 from .history import History
-from .pointer import PointerError, get, iter_strings, set_value
+from .pointer import PointerError, get, iter_leaves, set_value
 from .requests import RequestsFile
 from .runner import Busy, CommandFailed, Job, JobRunner
 from .store import SourceStore, SourceUnreadable, StaleSource, dumps
@@ -133,11 +133,17 @@ class EditorSession:
         self._issues: list[Issue] = []
         self._html = ""
         self._canonical_notice: str | None = None
+        if self.history.notice:
+            self._notices.append(self.history.notice)
 
         self._take_lock_file()
         self._reload()
         if self._differs_from_snapshot():
             self._record("open" if self.history.current() is None else "external")
+
+    @property
+    def config_file(self) -> Path:
+        return self._config_file or config.config_path()
 
     # -- lifecycle ---------------------------------------------------------
     def _take_lock_file(self) -> None:
@@ -178,7 +184,12 @@ class EditorSession:
         self._issues = self.adapter.validate(doc)
         self._valid = not _errors(self._issues)
         if self._valid:
-            self._html = self.adapter.render_edit_html(doc, self.project_dir)
+            try:
+                self._html = self.adapter.render_edit_html(doc, self.project_dir)
+            except Exception as exc:  # keep the last good page; never crash startup or a save
+                log.exception("rendering the edit page failed")
+                self._valid = False
+                self._issues = [*self._issues, Issue(f"cannot render the page: {type(exc).__name__}: {exc}")]
         if dumps(doc, text.endswith("\n")) != text:
             self._canonical_notice = (
                 f"{self.source_path.name} is not in the editor's JSON style; "
@@ -331,8 +342,8 @@ class EditorSession:
                 raise StaleSource(f"{pointer} no longer exists") from exc
             if current != old:
                 raise StaleSource(f"the value at {pointer} changed")
-            value = _coerce(old, new)
-            if value == old:
+            value = _coerce(current, new)  # the client's old loses 407.0 -> 407
+            if value == current and type(value) is type(current):
                 return {"hash": h, "issues": [], "figure_request": None}
             set_value(doc, pointer, value)
             issues = self._validate_edit(doc, pointer)
@@ -511,8 +522,12 @@ class EditorSession:
             self.edit_log.forget(pointer)
         if self._differs_from_snapshot():
             self._record("agent")
-        before = dict(iter_strings(self._agent_before)) if self._agent_before is not None else {}
-        changed = [p for p, v in iter_strings(after) if before.get(p) != v]
+        before = dict(iter_leaves(self._agent_before)) if self._agent_before is not None else {}
+        missing = object()
+        changed = [
+            p for p, v in iter_leaves(after)
+            if (old := before.get(p, missing)) is missing or type(old) is not type(v) or old != v
+        ]
         return {
             "ok": job.returncode == 0 and not job.cancelled and not job.timed_out,
             "returncode": job.returncode,
@@ -564,6 +579,7 @@ class EditorSession:
                 result = self.adapter.build_result(self.project_dir)
                 report = {
                     "ok": job.returncode == 0 and not job.cancelled and not job.timed_out,
+                    "cancelled": job.cancelled,
                     "pages": [p.name for p in result.pages],
                     "warnings": [asdict(w) for w in result.warnings],
                 }
@@ -572,7 +588,7 @@ class EditorSession:
                 self._reload()
             except Exception as exc:
                 log.exception("finishing the build failed")
-                report = {"ok": False, "pages": [],
+                report = {"ok": False, "cancelled": job.cancelled, "pages": [],
                           "warnings": [asdict(Issue(f"{type(exc).__name__}: {exc}"))]}
             finally:
                 self._job = None

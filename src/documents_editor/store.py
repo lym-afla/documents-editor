@@ -26,14 +26,20 @@ def dumps(doc: Any, trailing_newline: bool) -> str:
     return text + "\n" if trailing_newline else text
 
 
-def atomic_write_text(path: Path, text: str) -> None:
+def atomic_write_bytes(path: Path, data: bytes) -> None:
+    """Replace ``path`` with ``data`` via a temp file in the same directory.
+
+    An existing file keeps its permission mode.
+    """
     path = Path(path)
-    with tempfile.NamedTemporaryFile(
-        "w", encoding="utf-8", newline="", dir=path.parent, delete=False
-    ) as tmp:
+    try:
+        mode = path.stat().st_mode & 0o7777
+    except OSError:
+        mode = None
+    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
         tmp_name = tmp.name
         try:
-            tmp.write(text)
+            tmp.write(data)
             tmp.flush()
             os.fsync(tmp.fileno())
         except BaseException:
@@ -41,6 +47,8 @@ def atomic_write_text(path: Path, text: str) -> None:
             os.unlink(tmp_name)
             raise
     try:
+        if mode is not None:
+            os.chmod(tmp_name, mode)
         attempts = 5 if sys.platform == "win32" else 1
         for attempt in range(attempts):
             try:
@@ -54,6 +62,10 @@ def atomic_write_text(path: Path, text: str) -> None:
         if os.path.exists(tmp_name):
             os.unlink(tmp_name)
         raise
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    atomic_write_bytes(path, text.encode("utf-8"))
 
 
 def _sha256(data: bytes) -> str:

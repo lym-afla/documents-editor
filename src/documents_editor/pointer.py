@@ -67,6 +67,18 @@ def set_value(doc: Any, pointer: str, value: Any) -> None:
         raise PointerError(f"cannot descend into scalar in {pointer!r}")
 
 
+def iter_leaves(doc: Any, prefix: str = "") -> Iterator[tuple[str, Any]]:
+    """Every scalar (string, number, boolean, null) with its pointer, in document order."""
+    if isinstance(doc, dict):
+        for k, v in doc.items():
+            yield from iter_leaves(v, f"{prefix}/{_escape(str(k))}")
+    elif isinstance(doc, list):
+        for i, v in enumerate(doc):
+            yield from iter_leaves(v, f"{prefix}/{i}")
+    else:
+        yield prefix, doc
+
+
 def iter_strings(doc: Any, prefix: str = "") -> Iterator[tuple[str, str]]:
     if isinstance(doc, str):
         yield prefix, doc

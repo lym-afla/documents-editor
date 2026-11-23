@@ -5,12 +5,11 @@ import json
 import os
 import re
 import shutil
-import tempfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .store import atomic_write_text
+from .store import atomic_write_bytes, atomic_write_text
 
 _STAMP_FORMAT = "%Y%m%d-%H%M%S-%f"
 _STAMP_LEN = 22
@@ -27,11 +26,29 @@ class History:
         self.cap = cap
         self._cursor = -1
         self._entries: list[dict[str, Any]] = []
+        self.notice: str | None = None  # set when a damaged index was set aside
         index = self.directory / "index.json"
         if index.exists():
+            self._load(index)
+
+    def _load(self, index: Path) -> None:
+        try:
             data = json.loads(index.read_text(encoding="utf-8"))
-            self._cursor = data["cursor"]
-            self._entries = data["entries"]
+            cursor, entries = data["cursor"], data["entries"]
+            if not (isinstance(entries, list) and isinstance(cursor, int) and not isinstance(cursor, bool)
+                    and all(isinstance(e, dict) and isinstance(e.get("id"), str) for e in entries)
+                    and (0 if entries else -1) <= cursor < len(entries)):
+                raise ValueError("unexpected structure")
+        except (OSError, UnicodeDecodeError, ValueError, KeyError, TypeError) as exc:
+            broken = index.with_name(f"index.broken-{_now().strftime(_STAMP_FORMAT)}.json")
+            try:
+                os.replace(index, broken)
+            except OSError:
+                broken = index
+            self.notice = (f"undo history was unreadable ({exc}); started a fresh history, "
+                           f"old index kept as {broken.name}")
+            return
+        self._cursor, self._entries = cursor, entries
 
     @property
     def can_undo(self) -> bool:
@@ -94,7 +111,7 @@ class History:
         for i, path in enumerate(self.tracked):
             saved = snap / str(i)
             if saved.exists():
-                _atomic_write_bytes(path, saved.read_bytes())
+                atomic_write_bytes(path, saved.read_bytes())
             else:
                 path.unlink(missing_ok=True)
         self._cursor = cursor
@@ -105,16 +122,3 @@ class History:
         text = json.dumps({"cursor": self._cursor, "entries": self._entries}, indent=2)
         atomic_write_text(self.directory / "index.json", text + "\n")
 
-
-def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as tmp:
-        tmp_name = tmp.name
-        try:
-            tmp.write(data)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-        except BaseException:
-            tmp.close()
-            os.unlink(tmp_name)
-            raise
-    os.replace(tmp_name, path)

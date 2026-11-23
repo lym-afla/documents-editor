@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import signal
 import subprocess
 import threading
@@ -66,9 +67,10 @@ class JobRunner:
                 kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
             else:
                 kwargs["start_new_session"] = True
+            args = _resolve(command.args)
             try:
                 proc = subprocess.Popen(
-                    command.args,
+                    args,
                     cwd=command.cwd,
                     env=env,
                     stdin=subprocess.DEVNULL,
@@ -142,6 +144,19 @@ class JobRunner:
                 self._current = None
                 self._proc = None
         on_exit(job)
+
+
+def _resolve(args: list[str]) -> list[str]:
+    """Find a bare program name on PATH (including Windows .cmd/.bat shims)."""
+    if not args:
+        raise CommandFailed("empty command")
+    name = args[0]
+    if os.path.dirname(name):  # a path: Popen resolves it against the job's cwd
+        return list(args)
+    found = shutil.which(name)
+    if found is None:
+        raise CommandFailed(f"cannot run {name!r}: not found on PATH")
+    return [found, *args[1:]]
 
 
 def _terminate(proc: subprocess.Popen) -> None:

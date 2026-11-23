@@ -415,3 +415,65 @@ def test_shell_loading_after_the_page_still_connects(page, editor):
     held[0].continue_()
     page.unroute("**/static/app.js", hold)
     expect(frame.locator(".de-marker")).to_have_count(1)  # the shell reached the page
+
+
+class RawHtmlAdapter(SimpleDocAdapter):
+    """Renders the title unescaped, like a template that forgot to escape a field."""
+
+    def render_edit_html(self, source, project_dir):
+        html = super().render_edit_html(source, project_dir)
+        return html + f'<div id="raw">{source["title"]}</div>'
+
+
+def test_script_in_a_document_field_does_not_run(page, make_editor):
+    editor = make_editor(RawHtmlAdapter())
+    doc = json.loads(editor.doc_path.read_text(encoding="utf-8"))
+    doc["title"] = ('<img src="x.png" onerror="window.parent.pwned = 1">'
+                    '<script>window.parent.pwned = 2</script>'
+                    '<img src="data:," onload="window.parent.pwned = 3">')
+    editor.doc_path.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    editor.session.poll_external()
+    violations = []
+    page.on("console", lambda m: "Content Security Policy" in m.text and violations.append(m.text))
+    page.goto(editor.url)
+    frame = page.frame_locator("iframe#doc")
+    expect(frame.locator("#raw img")).to_have_count(2)
+    expect(frame.locator("#de-toolbar")).to_be_attached()  # the injected page.js still loads
+    page.wait_for_timeout(500)
+    assert page.evaluate("window.pwned") is None
+    assert violations
+    # editing still works through the shell
+    title = start_edit(frame, '[data-src="/title"]')
+    title.evaluate("el => { el.textContent = 'Safe'; }")
+    page.keyboard.press("Enter")
+    expect_json(editor.doc_path, "/title", "Safe")
+
+
+def test_token_leaves_the_address_bar_and_a_reload_cannot_save(page, editor):
+    page.goto(editor.url)
+    expect(page.locator("#status")).to_have_text("Ready")
+    assert urlsplit(page.url).query == "" and urlsplit(page.url).path == "/"
+    expect(page.locator("#token-banner")).to_be_hidden()
+    page.reload()
+    expect(page.locator("#token-banner")).to_be_visible()
+    frame = page.frame_locator("iframe#doc")
+    title = start_edit(frame, '[data-src="/title"]')  # reads still work with the cookie
+    title.evaluate("el => { el.textContent = 'Changed'; }")
+    page.keyboard.press("Enter")
+    page.wait_for_timeout(500)
+    assert json.loads(editor.doc_path.read_text(encoding="utf-8"))["title"] == "T"
+
+
+class FailingBuildAdapter(PagedAdapter):
+    def build_command(self, project_dir):
+        from documents_editor.adapter import Command
+        return Command([sys.executable, "-c", "import sys; sys.exit(3)"], project_dir)
+
+
+def test_failed_build_says_previews_are_from_the_previous_build(page, make_editor):
+    editor = make_editor(FailingBuildAdapter())
+    page.goto(editor.url)
+    page.click("#rebuild")
+    expect(page.locator("#pages-empty")).to_have_text(
+        "The build failed; these previews are from the previous build.")
+    expect(page.locator("#page-previews figure")).to_have_count(2)

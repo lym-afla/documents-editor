@@ -1,3 +1,5 @@
+import pytest
+
 from documents_editor.history import History
 
 
@@ -82,3 +84,24 @@ def test_missing_snapshot_dir_raises_and_leaves_files(tmp_path):
     with pytest.raises(FileNotFoundError):
         h.undo()
     assert src.read_text() == "v1" and h.current() != first and h.can_undo
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX permission bits")
+def test_undo_keeps_the_source_file_mode(tmp_path):
+    src = tmp_path / "doc.json"
+    src.write_text("v0"); src.chmod(0o640)
+    h = History(tmp_path / "h", [src]); h.record("open")
+    src.write_text("v1"); h.record("edit")
+    h.undo()
+    assert src.read_text() == "v0" and src.stat().st_mode & 0o7777 == 0o640
+
+
+@pytest.mark.parametrize("index", ["{not json", '{"cursor": 0}', '{"cursor": 5, "entries": []}', "[]"])
+def test_corrupt_index_starts_fresh_history_with_notice(tmp_path, index):
+    src = tmp_path / "doc.json"; src.write_text("v0")
+    (tmp_path / "h").mkdir(); (tmp_path / "h" / "index.json").write_text(index)
+    h = History(tmp_path / "h", [src])
+    assert h.entries() == [] and h.current() is None and "fresh history" in h.notice
+    assert list((tmp_path / "h").glob("index.broken-*.json"))
+    h.record("open")
+    assert History(tmp_path / "h", [src]).current() == h.current()

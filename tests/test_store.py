@@ -61,3 +61,17 @@ def test_trailing_newline_kept_as_found(tmp_path):
     store.write(doc, h)
     assert p.read_text(encoding="utf-8") == '{\n  "a": 1\n}'
     assert store.is_canonical()
+
+
+@pytest.mark.skipif(__import__("os").name != "posix", reason="POSIX permission bits")
+def test_atomic_writes_keep_the_file_mode(tmp_path):
+    from documents_editor.store import atomic_write_bytes
+
+    p = tmp_path / "doc.json"
+    p.write_text("{}\n", encoding="utf-8")
+    p.chmod(0o640)
+    atomic_write_text(p, '{"a": 1}\n')
+    assert p.stat().st_mode & 0o7777 == 0o640
+    p.chmod(0o604)
+    atomic_write_bytes(p, b"{}\n")
+    assert p.stat().st_mode & 0o7777 == 0o604 and p.read_bytes() == b"{}\n"

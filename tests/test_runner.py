@@ -142,3 +142,23 @@ def test_cancel_inside_on_exit_is_ignored(tmp_path):
     r.start("t", Command([sys.executable, "-c", "pass"], tmp_path), timeout_s=None,
             on_line=print, on_exit=exit_)
     assert done.wait(10) and not jobs[0].cancelled
+
+
+def test_bare_program_name_is_resolved_on_path(tmp_path, monkeypatch):
+    import os
+    import threading
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    if os.name == "nt":
+        shim = bin_dir / "fake-agent.cmd"
+        shim.write_text(f'@"{sys.executable}" -c "print(\'shim ran\')"\r\n')
+    else:
+        shim = bin_dir / "fake-agent"
+        shim.write_text(f"#!{sys.executable}\nprint('shim ran')\n")
+        shim.chmod(0o755)
+    monkeypatch.setenv("PATH", str(bin_dir) + os.pathsep + os.environ.get("PATH", ""))
+    done, lines = threading.Event(), []
+    job = JobRunner().start("t", Command(["fake-agent"], tmp_path), timeout_s=None,
+                            on_line=lines.append, on_exit=lambda j: done.set())
+    assert done.wait(10) and job.returncode == 0 and lines == ["shim ran"]

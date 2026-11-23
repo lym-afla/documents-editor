@@ -42,3 +42,20 @@ def test_config_path_uses_xdg(monkeypatch, tmp_path):
     monkeypatch.setattr(config.sys, "platform", "linux")
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
     assert config.config_path() == tmp_path / "documents-editor" / "documents-editor.toml"
+
+
+def test_agent_that_is_not_a_table_raises(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_text('agent = "x"\n')
+    with pytest.raises(ConfigError, match="table"):
+        agent_settings("simple", ["d"], path=cfg)
+    cfg.write_text('[agent]\nsimple = "x"\n')
+    with pytest.raises(ConfigError, match="table"):
+        agent_settings("simple", ["d"], path=cfg)
+
+
+def test_non_utf8_config_raises_config_error(tmp_path):
+    cfg = tmp_path / "c.toml"
+    cfg.write_bytes(b'[agent.simple]\ncommand = ["\xff"]\n')
+    with pytest.raises(ConfigError, match="cannot read"):
+        agent_settings("simple", ["d"], path=cfg)

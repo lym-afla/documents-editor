@@ -313,7 +313,7 @@ def test_accept_forgets_edit(session):
 def test_build_publishes_result(session, bus, tmp_path):
     q = bus.subscribe(); session.start_build()
     done = wait_event(q, "build-done")
-    assert done == {"ok": True, "pages": [], "warnings": []}
+    assert done == {"ok": True, "cancelled": False, "pages": [], "warnings": []}
     assert (tmp_path / "build.log").exists()
 
 
@@ -454,3 +454,93 @@ def test_unreadable_source_starts_invalid_and_poll_never_raises(doc_path, make_s
         assert s.state()["valid"] is False
     finally:
         doc_path.chmod(0o644)
+
+
+# -- final review fixes -------------------------------------------------------
+
+def test_integer_text_in_float_cell_stays_float_when_client_sends_int_old(make_session, doc_path):
+    write_doc(doc_path, dict(DOC, table=[["x", 407.0]]))
+    session = make_session()
+    session.patch("/table/0/1", 407, "412", session.state()["hash"])  # browser-shaped: 407.0 -> 407
+    stored = json.loads(doc_path.read_text(encoding="utf-8"))["table"][0][1]
+    assert stored == 412.0 and isinstance(stored, float)
+
+
+def test_agent_changed_includes_numbers_and_booleans(make_session, doc_path, bus, fake_agent):
+    write_doc(doc_path, dict(DOC, table=[["x", 2, True]]))
+    session = make_session()
+    report = run_agent(session, bus, fake_agent, set_paths={"/table/0/1": 3, "/table/0/2": False})
+    assert {"/table/0/1", "/table/0/2"} <= set(report["changed"])
+    assert "/title" not in report["changed"]
+
+
+class _ExplodingAdapter(SimpleDocAdapter):
+    explode = False
+
+    def render_edit_html(self, source, project_dir):
+        if self.explode or source["title"] == "boom":
+            raise RuntimeError("renderer broke")
+        return super().render_edit_html(source, project_dir)
+
+
+def test_render_failure_at_startup_is_an_issue_not_a_crash(tmp_path, doc_path, bus):
+    write_doc(doc_path, dict(DOC, title="boom"))
+    s = EditorSession(_ExplodingAdapter(), tmp_path, bus=bus, runner=JobRunner(),
+                      config_file=tmp_path / "cfg.toml", confirm_file=tmp_path / "confirmed.json")
+    try:
+        st = s.state()
+        assert st["valid"] is False and "renderer broke" in st["issues"][-1]["message"]
+        assert s.page_html() == ""
+    finally:
+        s.close()
+
+
+def test_render_failure_after_save_keeps_last_good_page(tmp_path, doc_path, bus):
+    s = EditorSession(_ExplodingAdapter(), tmp_path, bus=bus, runner=JobRunner(),
+                      config_file=tmp_path / "cfg.toml", confirm_file=tmp_path / "confirmed.json")
+    try:
+        good = s.page_html()
+        s.patch("/title", "T", "boom", s.state()["hash"])
+        st = s.state()
+        assert json.loads(doc_path.read_text(encoding="utf-8"))["title"] == "boom"
+        assert st["valid"] is False and "renderer broke" in st["issues"][-1]["message"]
+        assert s.page_html() == good
+        s.undo()
+        assert s.state()["valid"] is True
+    finally:
+        s.close()
+
+
+def test_corrupt_history_index_becomes_a_notice(tmp_path, make_session):
+    (tmp_path / ".editor" / "history").mkdir(parents=True)
+    (tmp_path / ".editor" / "history" / "index.json").write_text("{oops", encoding="utf-8")
+    s = make_session()
+    assert any("fresh history" in n for n in s.state()["notices"])
+    assert len(s.history.entries()) == 1  # "open" recorded into the new history
+
+
+def test_startup_lines_show_the_agent_command(session, tmp_path, fake_agent):
+    from documents_editor.app import startup_lines
+
+    fake_agent()
+    lines = startup_lines(session, "http://127.0.0.1:1/?t=x")
+    assert lines[0] == "Editor: http://127.0.0.1:1/?t=x" and lines[1].startswith("Agent config: ")
+    assert lines[2].startswith("Agent command: ") and str(session.source_path) in lines[2]
+    (tmp_path / "cfg.toml").write_text('[agent.simple]\ncommand = ["{nope}"]\n')
+    assert "not runnable" in startup_lines(session, "u")[2]
+
+
+def test_failed_build_reports_not_ok(make_session, bus, tmp_path):
+    from documents_editor.adapter import Command
+
+    class Failing(SimpleDocAdapter):
+        def build_command(self, project_dir):
+            return Command([sys.executable, "-c", "import sys; sys.exit(3)"], project_dir)
+
+    s = EditorSession(Failing(), tmp_path, bus=bus, runner=JobRunner(),
+                      config_file=tmp_path / "cfg.toml", confirm_file=tmp_path / "confirmed.json")
+    try:
+        q = bus.subscribe(); s.start_build()
+        assert wait_event(q, "build-done") == {"ok": False, "cancelled": False, "pages": [], "warnings": []}
+    finally:
+        s.close()

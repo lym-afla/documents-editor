@@ -12,6 +12,7 @@ from .store import atomic_write_text
 _CATEGORIES = ("format", "text")
 _SCOPES = ("document", "house_style")
 _UPDATABLE = ("instruction", "scope", "category", "status")
+_STATUSES = ("open", "done", "needs_input", "declined")
 
 
 class RequestsFile:
@@ -106,6 +107,8 @@ class RequestsFile:
             raise ValueError(f"invalid category: {fields['category']!r}")
         if "scope" in fields and fields["scope"] not in _SCOPES:
             raise ValueError(f"invalid scope: {fields['scope']!r}")
+        if "status" in fields and fields["status"] not in _STATUSES:
+            raise ValueError(f"invalid status: {fields['status']!r}")
         doc, newline = self._fresh()
         for request in doc["requests"]:
             if request.get("id") == request_id:

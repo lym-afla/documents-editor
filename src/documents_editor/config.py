@@ -37,11 +37,16 @@ def agent_settings(adapter_name: str, default: list[str], path: Path | None = No
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return AgentSettings(list(default))
-    except (tomllib.TOMLDecodeError, OSError) as exc:
+    except (tomllib.TOMLDecodeError, OSError, UnicodeDecodeError) as exc:
         raise ConfigError(f"cannot read {path}: {exc}") from exc
-    section = data.get("agent", {}).get(adapter_name)
-    if not isinstance(section, dict):
+    agent = data.get("agent", {})
+    if not isinstance(agent, dict):
+        raise ConfigError(f"{path}: 'agent' must be a table such as [agent.{adapter_name}]")
+    section = agent.get(adapter_name)
+    if section is None:
         return AgentSettings(list(default))
+    if not isinstance(section, dict):
+        raise ConfigError(f"{path}: [agent.{adapter_name}] must be a table")
     command = section.get("command", default)
     if not isinstance(command, list) or not all(isinstance(a, str) for a in command) or not command:
         raise ConfigError(f"[agent.{adapter_name}] command must be a non-empty list of strings")

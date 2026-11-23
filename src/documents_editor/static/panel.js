@@ -280,8 +280,11 @@ function revealPage(name) {
 }
 
 export function showBuild(report) {
-  show($("#pages-empty"), !report.pages.length);
-  $("#pages-empty").textContent = report.pages.length ? "" : "The build produced no page previews.";
+  const stale = !report.ok && report.pages.length > 0;
+  show($("#pages-empty"), !report.pages.length || stale);
+  $("#pages-empty").textContent = stale
+    ? `The build ${report.cancelled ? "was cancelled" : "failed"}; these previews are from the previous build.`
+    : report.pages.length ? "" : "The build produced no page previews.";
   $("#build-warnings").replaceChildren(...report.warnings.map((w) => {
     const page = namedPage(w, report.pages);
     return h("li", { class: w.severity || "warning" },
@@ -292,6 +295,7 @@ export function showBuild(report) {
     h("figure", { "data-page": name },
       h("img", { src: `/api/pages/${q(name)}?v=${Date.now()}`, alt: `Page preview ${name}`, loading: "lazy" }),
       h("figcaption", { text: name }))));
-  toast(report.ok ? "Build finished" : "Build failed – see the Log tab", report.ok ? "info" : "error");
+  const failed = report.cancelled ? "Build cancelled" : "Build failed – see the Log tab";
+  toast(report.ok ? "Build finished" : failed, report.ok ? "info" : "error");
   showTab("pages");
 }

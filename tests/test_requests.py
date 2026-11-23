@@ -122,3 +122,12 @@ def test_figure_request_stays_manageable(tmp_path):
         f.update(a["id"], category="figure")
     f.delete(r["id"])
     assert [x["id"] for x in f.load()[0]] == [a["id"]]
+
+
+def test_update_rejects_unknown_status(tmp_path):
+    f = RequestsFile(tmp_path / "r.json")
+    a = _add(f)
+    with pytest.raises(ValueError, match="status"):
+        f.update(a["id"], status="finished")
+    for status in ("open", "done", "needs_input", "declined"):
+        assert f.update(a["id"], status=status)["status"] == status
